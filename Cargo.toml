@@ -1,0 +1,8 @@
+[package]
+name = "ksp-lite"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.18.1"
+bevy_rapier3d = "0.33.0"
