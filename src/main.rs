@@ -36,10 +36,20 @@ fn setup_scene(
 ) {
     // Planet (Sphere)
     commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(10.0))),
+        Mesh3d(meshes.add(Sphere::new(200.0))),
         MeshMaterial3d(materials.add(Color::srgb(0.2, 0.6, 0.4))),
-        Transform::from_xyz(0.0, -10.0, 0.0),
-        Collider::ball(10.0),
+        Transform::from_xyz(0.0, -200.0, 0.0),
+        Collider::ball(200.0),
+        RigidBody::Fixed,
+    ));
+
+    // Launch Pad
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(6.0, 0.5, 6.0))),
+        MeshMaterial3d(materials.add(Color::srgb(0.3, 0.3, 0.3))),
+        Transform::from_xyz(0.0, 0.25, 0.0),
+        RigidBody::Fixed,
+        Collider::cuboid(3.0, 0.25, 3.0),
     ));
 
     // A simple directional light
