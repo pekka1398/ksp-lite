@@ -11,6 +11,9 @@ enum AppState {
     MapView,
 }
 
+#[derive(Component)]
+struct MapViewCamera;
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
@@ -23,6 +26,8 @@ fn main() {
             (
                 rocket_flight_system,
                 telemetry_system,
+                orbit_prediction_system,
+                map_view_toggle_system,
             ),
         )
         .add_systems(
@@ -243,14 +248,14 @@ fn rocket_flight_system(
     keys: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
     planet_q: Query<(&CelestialBody, &Transform), Without<Rocket>>,
-    mut rocket_q: Query<(Entity, &mut Rocket, &Transform, &mut ExternalForce, &Velocity)>,
+    mut rocket_q: Query<(Entity, &mut Rocket, &Transform, &mut ExternalForce, &Velocity, &mut FuelTank, &Engine, &mut ColliderMassProperties)>,
     mut part_q: Query<(Entity, &mut FuelTank, &Engine, &mut ExternalForce, &mut ColliderMassProperties, &Transform), Without<Rocket>>,
     mut flame_q: Query<(&mut Visibility, &ExhaustFlame)>,
     joint_q: Query<(Entity, &ImpulseJoint)>,
 ) {
     let dt = time.delta_secs();
 
-    let Ok((rocket_entity, mut rocket, rocket_tf, mut rocket_ext_force, rocket_vel)) = rocket_q.get_single_mut() else { return; };
+    let Ok((rocket_entity, mut rocket, rocket_tf, mut rocket_ext_force, rocket_vel, mut rocket_fuel, rocket_engine, mut rocket_mass_props)) = rocket_q.get_single_mut() else { return; };
     let Ok((planet, planet_tf)) = planet_q.get_single() else { return; };
 
     // Launch / Stage logic
@@ -304,20 +309,40 @@ fn rocket_flight_system(
     // Update main vessel forces
     rocket_ext_force.torque = world_torque;
 
-    // Process other rocket parts (Decoupled Boosters, etc.)
-    for (entity, mut fuel, engine, mut ext_force, mut mass_props, transform) in part_q.iter_mut() {
+    // --- Combined Force Calculation ---
+    // Handle the main Rocket entity
+    {
         let mut total_force = Vec3::ZERO;
 
-        // Thrust
+        // Thrust for active stage
+        if rocket_engine.stage == rocket.current_stage && rocket.throttle > 0.0 && rocket_fuel.fuel_mass > 0.0 {
+            let burnt = rocket_engine.fuel_burn_rate * rocket.throttle * dt;
+            rocket_fuel.fuel_mass = (rocket_fuel.fuel_mass - burnt).max(0.0);
+            *rocket_mass_props = ColliderMassProperties::Mass(rocket_fuel.dry_mass + rocket_fuel.fuel_mass);
+            total_force += rocket_tf.up() * rocket.throttle * rocket_engine.max_thrust;
+        }
+
+        // Gravity
+        let body_mass = if let ColliderMassProperties::Mass(m) = *rocket_mass_props { m } else { 1.0 };
+        let to_planet = planet_tf.translation - rocket_tf.translation;
+        let dist_sq = to_planet.length_squared();
+        if dist_sq > 0.1 {
+            total_force += to_planet.normalize() * (planet.mu * body_mass / dist_sq);
+        }
+        rocket_ext_force.force = total_force;
+    }
+
+    // 2. Handle other parts (Boosters)
+    for (_entity, mut fuel, engine, mut ext_force, mut mass_props, transform) in part_q.iter_mut() {
+        let mut total_force = Vec3::ZERO;
+
+        // Thrust (if this part is the active stage - usually only the main body is active,
+        // but this allows for boosters to have their own "Rocket" logic if we expanded)
         if engine.stage == rocket.current_stage && rocket.throttle > 0.0 && fuel.fuel_mass > 0.0 {
             let burnt = engine.fuel_burn_rate * rocket.throttle * dt;
             fuel.fuel_mass = (fuel.fuel_mass - burnt).max(0.0);
-
-            // Adjust physics mass
             *mass_props = ColliderMassProperties::Mass(fuel.dry_mass + fuel.fuel_mass);
-
-            let thrust = transform.up() * rocket.throttle * engine.max_thrust;
-            total_force += thrust;
+            total_force += transform.up() * rocket.throttle * engine.max_thrust;
         }
 
         // Gravity
@@ -398,18 +423,153 @@ fn telemetry_system(
     );
 }
 
+fn orbit_prediction_system(
+    mut gizmos: Gizmos,
+    planet_q: Query<(&CelestialBody, &Transform)>,
+    rocket_q: Query<(&Transform, &Velocity, &ColliderMassProperties, Entity), With<Rocket>>,
+    part_q: Query<(Entity, &Transform, &ColliderMassProperties, &Velocity), Without<Rocket>>,
+    joint_q: Query<&ImpulseJoint>,
+    state: Res<State<AppState>>,
+) {
+    if *state.get() != AppState::MapView { return; }
+
+    let Ok((planet, planet_tf)) = planet_q.get_single() else { return; };
+    let Ok((rocket_tf, rocket_vel, rocket_mass_props, rocket_entity)) = rocket_q.get_single() else { return; };
+
+    // --- Calculate Barycentric (Center of Mass) State ---
+    // We need the average position and velocity of the whole assembly to keep the orbit stable
+    let mut total_mass = 0.0;
+    let mut weighted_pos = Vec3::ZERO;
+    let mut weighted_vel = Vec3::ZERO;
+
+    // Add main rocket
+    let m0 = if let ColliderMassProperties::Mass(m) = *rocket_mass_props { m } else { 1.0 };
+    total_mass += m0;
+    weighted_pos += rocket_tf.translation * m0;
+    weighted_vel += rocket_vel.linvel * m0;
+
+    // Add attached parts
+    for (part_entity, part_tf, part_mass_props, part_vel) in part_q.iter() {
+        // Only count parts that are actually joined to the rocket
+        let is_attached = joint_q.iter().any(|j|
+            (j.parent == rocket_entity && part_entity == part_entity) || // Simpler check: is it in the scene
+            true // For now, we assume all parts in part_q are either boosters or the active ship
+        );
+
+        if is_attached {
+            let m = if let ColliderMassProperties::Mass(m) = *part_mass_props { m } else { 1.0 };
+            total_mass += m;
+            weighted_pos += part_tf.translation * m;
+            weighted_vel += part_vel.linvel * m;
+        }
+    }
+
+    let com_pos = weighted_pos / total_mass;
+    let com_vel = weighted_vel / total_mass;
+
+    let pos = com_pos - planet_tf.translation;
+    let vel = com_vel;
+    let mu = planet.mu;
+
+    // 1. Orbit Thresholds: Only predict if altitude > 10m and velocity > 10m/s
+    let altitude = pos.length() - planet.radius;
+    let speed = vel.length();
+    if altitude < 10.0 || speed < 10.0 { return; }
+
+    // Specific angular momentum h = r x v
+    let h = pos.cross(vel);
+    let h_mag = h.length();
+    if h_mag < 0.001 { return; }
+
+    // Eccentricity vector e = (v x h) / mu - r / |r|
+    let e_vec = (vel.cross(h) / mu) - (pos.normalize());
+    let e = e_vec.length();
+
+    // Specific orbital energy E = v^2 / 2 - mu / r
+    let energy = vel.length_squared() / 2.0 - mu / pos.length();
+
+    // Semi-major axis a
+    let a = if (1.0 - e).abs() < 0.001 {
+        // Parabolic case (rare)
+        1000000.0
+    } else if e < 1.0 {
+        // Elliptic
+        -mu / (2.0 * energy)
+    } else {
+        // Hyperbolic
+        mu / (2.0 * energy.abs())
+    };
+
+    // Basis vectors for the orbital plane
+    let p = e_vec.normalize_or(Vec3::X); // Vector towards periapsis
+    let q = h.cross(p).normalize();             // Vector at 90 deg to periapsis
+
+    let num_segments = 128;
+
+    if e < 1.0 {
+        // DRAW ELLIPSE
+        let b = a * (1.0 - e * e).sqrt(); // Semi-minor axis
+        let center = planet_tf.translation - p * (a * e);
+
+        let mut points = Vec::with_capacity(num_segments + 1);
+        for i in 0..=num_segments {
+            let angle = (i as f32 / num_segments as f32) * std::f32::consts::TAU;
+            let local_pos = p * (a * angle.cos()) + q * (b * angle.sin());
+            points.push(center + local_pos);
+        }
+        gizmos.linestrip(points, Color::srgb(0.0, 0.8, 1.0));
+    } else {
+        // DRAW HYPERBOLA
+        // Draw only the part of the hyperbola near the planet
+        let mut points = Vec::new();
+        let max_nu = (1.0 / e).acos().max(0.1); // Angle of asymptote
+        let render_nu = max_nu * 0.95; // Don't draw to infinity
+
+        for i in 0..=num_segments {
+            let nu = -render_nu + (i as f32 / num_segments as f32) * (2.0 * render_nu);
+            let r_mag = (a * (e * e - 1.0)) / (1.0 + e * nu.cos());
+            if r_mag > 5000.0 { continue; } // Clipping distance
+            let local_pos = p * (r_mag * nu.cos()) + q * (r_mag * nu.sin());
+            points.push(planet_tf.translation + local_pos);
+        }
+        if points.len() > 1 {
+            gizmos.linestrip(points, Color::srgb(1.0, 0.5, 0.0));
+        }
+    }
+}
+
+fn map_view_toggle_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    state: Res<State<AppState>>,
+    mut next_state: ResMut<NextState<AppState>>,
+) {
+    if keys.just_pressed(KeyCode::KeyM) {
+        match state.get() {
+            AppState::Flight | AppState::VAB => next_state.set(AppState::MapView),
+            AppState::MapView => next_state.set(AppState::Flight),
+        }
+    }
+}
+
 fn camera_controller(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
+    state: Res<State<AppState>>,
     mut mouse_motion_events: EventReader<MouseMotion>,
     mut mouse_wheel_events: EventReader<MouseWheel>,
     mut query: Query<(&mut Transform, &mut OrbitCamera)>,
     rocket_query: Query<&Transform, (With<Rocket>, Without<OrbitCamera>)>,
+    planet_query: Query<&Transform, (With<CelestialBody>, Without<OrbitCamera>)>,
 ) {
     let dt = time.delta_secs();
-    let rocket_transform = rocket_query.get_single().ok();
-    let target_pos = rocket_transform.map(|t| t.translation).unwrap_or(Vec3::ZERO);
+
+    // Focus target depends on state
+    let target_pos = if *state.get() == AppState::MapView {
+        planet_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO)
+    } else {
+        rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO)
+    };
 
     // Process inputs outside so they aren't consumed per-camera
     let mut kb_yaw_delta = 0.0;
@@ -433,10 +593,16 @@ fn camera_controller(
 
     // Mouse scroll
     for event in mouse_wheel_events.read() {
-        if let MouseScrollUnit::Line = event.unit {
-            zoom_delta -= event.y * 2.0;
+        let zoom_scale = if *state.get() == AppState::MapView {
+            100.0 // Much faster zoom in MapView
         } else {
-            zoom_delta -= event.y * 0.02;
+            2.0
+        };
+
+        if let MouseScrollUnit::Line = event.unit {
+            zoom_delta -= event.y * zoom_scale;
+        } else {
+            zoom_delta -= event.y * (zoom_scale * 0.01);
         }
     }
 
@@ -454,8 +620,20 @@ fn camera_controller(
 
         orbit.pitch = orbit.pitch.clamp(-1.5, 1.5); // Prevent flipping
 
+        let (min_dist, max_dist) = if *state.get() == AppState::MapView {
+            (210.0, 5000.0) // Map view zoom (above planet surface)
+        } else {
+            (2.0, 100.0)    // Flight view zoom
+        };
+
         orbit.distance += zoom_delta;
-        orbit.distance = orbit.distance.clamp(2.0, 100.0);
+
+        // If switching to MapView, ensure we are outside the planet
+        if *state.get() == AppState::MapView && orbit.distance < min_dist {
+            orbit.distance = 500.0;
+        }
+
+        orbit.distance = orbit.distance.clamp(min_dist, max_dist);
 
         // Calculate new position
         let rotation = Quat::from_euler(EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
