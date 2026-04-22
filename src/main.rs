@@ -18,7 +18,13 @@ fn main() {
         .add_plugins(RapierDebugRenderPlugin::default())
         .init_state::<AppState>()
         .add_systems(Startup, setup_scene)
-        .add_systems(Update, (rocket_flight_system, telemetry_system))
+        .add_systems(
+            Update,
+            (
+                rocket_flight_system,
+                telemetry_system,
+            ),
+        )
         .add_systems(
             PostUpdate,
             camera_controller
@@ -34,6 +40,13 @@ struct OrbitCamera {
     distance: f32,
     pitch: f32,
     yaw: f32,
+}
+
+#[derive(Component)]
+struct CelestialBody {
+    name: String,
+    mu: f32, // standard gravitational parameter
+    radius: f32,
 }
 
 #[derive(Component)]
@@ -77,6 +90,11 @@ fn setup_scene(
         Transform::from_xyz(0.0, -200.0, 0.0),
         Collider::ball(200.0),
         RigidBody::Fixed,
+        CelestialBody {
+            name: "Kerbin".to_string(),
+            mu: 9.81 * 200.0 * 200.0,
+            radius: 200.0,
+        },
     ));
 
     // Launch Pad
@@ -110,6 +128,7 @@ fn setup_scene(
         MeshMaterial3d(mat_upper.clone()),
         Transform::from_xyz(0.0, 4.25, 0.0), // Lifted: 2.3 + 1.95 = 4.25
         RigidBody::Dynamic,
+        GravityScale(0.0),
         Collider::cylinder(0.5, 0.5),
         ColliderMassProperties::Mass(1500.0 + 1000.0),
         ExternalForce::default(),
@@ -155,6 +174,7 @@ fn setup_scene(
         MeshMaterial3d(mat_lower),
         Transform::from_xyz(0.0, 2.3, 0.0), // Lifted: Booster bottom at 0.5 + engine (0.4nd) clearance
         RigidBody::Dynamic,
+        GravityScale(0.0),
         Collider::cylinder(1.0, 0.5),
         ColliderMassProperties::Mass(2000.0 + 3000.0),
         ExternalForce::default(),
@@ -222,23 +242,22 @@ fn rocket_flight_system(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
-    mut rocket_q: Query<(Entity, &mut Rocket, &Transform)>,
-    mut part_q: Query<(Entity, &mut FuelTank, &Engine, &mut ExternalForce, &mut ColliderMassProperties, &Transform)>,
+    planet_q: Query<(&CelestialBody, &Transform), Without<Rocket>>,
+    mut rocket_q: Query<(Entity, &mut Rocket, &Transform, &mut ExternalForce, &Velocity)>,
+    mut part_q: Query<(Entity, &mut FuelTank, &Engine, &mut ExternalForce, &mut ColliderMassProperties, &Transform), Without<Rocket>>,
     mut flame_q: Query<(&mut Visibility, &ExhaustFlame)>,
     joint_q: Query<(Entity, &ImpulseJoint)>,
 ) {
     let dt = time.delta_secs();
 
-    let Ok((rocket_entity, mut rocket, _)) = rocket_q.get_single_mut() else { return; };
+    let Ok((rocket_entity, mut rocket, rocket_tf, mut rocket_ext_force, rocket_vel)) = rocket_q.get_single_mut() else { return; };
+    let Ok((planet, planet_tf)) = planet_q.get_single() else { return; };
 
     // Launch / Stage logic
     if keys.just_pressed(KeyCode::Space) {
         if !rocket.is_launched {
             rocket.is_launched = true;
         } else if rocket.current_stage > 0 {
-            // DECOUPLE
-            // Find the joint connecting TO our rocket_entity or FROM it.
-            // In our setup, stage1_entity had the ImpulseJoint pointing to stage0_entity (rocket_entity).
             for (joint_entity, joint) in joint_q.iter() {
                 if joint.parent == rocket_entity {
                     commands.entity(joint_entity).remove::<ImpulseJoint>();
@@ -262,20 +281,34 @@ fn rocket_flight_system(
     if keys.just_pressed(KeyCode::KeyX) { rocket.throttle = 0.0; }
     rocket.throttle = rocket.throttle.clamp(0.0, 1.0);
 
-    // Apply SAS Torque to the main rocket entity (the command pod/vessel)
-    if let Ok((_, _, _, mut ext_force, _, transform)) = part_q.get_mut(rocket_entity) {
-        let mut local_torque = Vec3::ZERO;
-        let torque_amount = 8000.0;
-        if keys.pressed(KeyCode::KeyW) { local_torque.x += torque_amount; }
-        if keys.pressed(KeyCode::KeyS) { local_torque.x -= torque_amount; }
-        if keys.pressed(KeyCode::KeyA) { local_torque.z += torque_amount; }
-        if keys.pressed(KeyCode::KeyD) { local_torque.z -= torque_amount; }
-        ext_force.torque = transform.rotation * local_torque;
-    }
+    // SAS / Manual Control
+    let mut target_torque = Vec3::ZERO;
+    let torque_amount = 8000.0;
+    let mut manual_input = false;
 
-    // Process all rocket parts (Engines and Fuel Tanks)
-    for (_entity, mut fuel, engine, mut ext_force, mut mass_props, transform) in part_q.iter_mut() {
-        // Only active stage engine burns
+    if keys.pressed(KeyCode::KeyW) { target_torque.x += torque_amount; manual_input = true; }
+    if keys.pressed(KeyCode::KeyS) { target_torque.x -= torque_amount; manual_input = true; }
+    if keys.pressed(KeyCode::KeyA) { target_torque.z += torque_amount; manual_input = true; }
+    if keys.pressed(KeyCode::KeyD) { target_torque.z -= torque_amount; manual_input = true; }
+    if keys.pressed(KeyCode::KeyQ) { target_torque.y += torque_amount; manual_input = true; }
+    if keys.pressed(KeyCode::KeyE) { target_torque.y -= torque_amount; manual_input = true; }
+
+    let world_torque = if manual_input {
+        rocket_tf.rotation * target_torque
+    } else {
+        // Stability mode: damp angular velocity
+        let damping_strength = 2000.0;
+        -rocket_vel.angvel * damping_strength
+    };
+
+    // Update main vessel forces
+    rocket_ext_force.torque = world_torque;
+
+    // Process other rocket parts (Decoupled Boosters, etc.)
+    for (entity, mut fuel, engine, mut ext_force, mut mass_props, transform) in part_q.iter_mut() {
+        let mut total_force = Vec3::ZERO;
+
+        // Thrust
         if engine.stage == rocket.current_stage && rocket.throttle > 0.0 && fuel.fuel_mass > 0.0 {
             let burnt = engine.fuel_burn_rate * rocket.throttle * dt;
             fuel.fuel_mass = (fuel.fuel_mass - burnt).max(0.0);
@@ -284,10 +317,24 @@ fn rocket_flight_system(
             *mass_props = ColliderMassProperties::Mass(fuel.dry_mass + fuel.fuel_mass);
 
             let thrust = transform.up() * rocket.throttle * engine.max_thrust;
-            ext_force.force = thrust;
-        } else {
-            ext_force.force = Vec3::ZERO;
-            // Spent stages still have mass (already handled by mass_props being on the entity)
+            total_force += thrust;
+        }
+
+        // Gravity
+        let body_mass = match *mass_props {
+            ColliderMassProperties::Mass(m) => m,
+            _ => 1.0,
+        };
+        let to_planet = planet_tf.translation - transform.translation;
+        let dist_sq = to_planet.length_squared();
+        if dist_sq > 0.1 {
+            let force_mag = (planet.mu * body_mass) / dist_sq;
+            total_force += to_planet.normalize() * force_mag;
+        }
+
+        // UPDATE EXTERNAL FORCES CONDITIONAL: Solves Jitter (Allows body to sleep).
+        if ext_force.force.distance_squared(total_force) > 0.001 {
+            ext_force.force = total_force;
         }
 
         // Update Flame visibility
@@ -304,10 +351,12 @@ fn rocket_flight_system(
 }
 
 fn telemetry_system(
+    planet_q: Query<(&CelestialBody, &Transform), Without<Rocket>>,
     rocket_q: Query<(&Rocket, &Transform, &Velocity)>,
     part_q: Query<(&FuelTank, &Engine)>,
     mut text_q: Query<&mut Text, With<TelemetryUI>>,
 ) {
+    let Ok((planet, p_transform)) = planet_q.get_single() else { return; };
     let Ok((rocket, transform, velocity)) = rocket_q.get_single() else { return; };
     let Ok(mut text) = text_q.get_single_mut() else { return; };
 
@@ -316,27 +365,36 @@ fn telemetry_system(
     let mut current_thrust = 0.0;
     for (tank, engine) in part_q.iter() {
         if engine.stage == rocket.current_stage {
-            current_fuel = tank.fuel_mass;
-            current_thrust = rocket.throttle * engine.max_thrust;
+            current_fuel += tank.fuel_mass;
+            if tank.fuel_mass > 0.0 {
+                current_thrust += rocket.throttle * engine.max_thrust;
+            }
         }
     }
 
-    let planet_center = Vec3::new(0.0, -200.0, 0.0);
-    let altitude = transform.translation.distance(planet_center) - 200.0;
+    let planet_center = p_transform.translation;
+    let to_planet = transform.translation - planet_center;
+    let dist = to_planet.length();
+    let local_up = if dist > 0.0 { to_planet / dist } else { Vec3::Y };
+    let altitude = dist - planet.radius;
     let vel_mag = velocity.linvel.length();
-    let (yaw, pitch, roll) = transform.rotation.to_euler(EulerRot::YXZ);
+
+    let pitch_deg = transform.up().dot(local_up).asin().to_degrees();
+    let vertical_vel = velocity.linvel.dot(local_up);
+    let surface_vel = (velocity.linvel - local_up * vertical_vel).length();
 
     text.0 = format!(
-        "Stage: {}\nAltitude: {:.1} m\nVelocity: {:.1} m/s\nThrottle: {:.0}%\nThrust: {:.0} N\nFuel: {:.0} kg\nPitch: {:.1} deg Yaw: {:.1} deg Roll: {:.1} deg",
+        "Central Body: {}\nStage: {}\nAltitude: {:.1} m\nPitch (vs Horizon): {:.1} deg\nOrbital Vel: {:.1} m/s\nSurface Vel: {:.1} m/s\nV.Speed: {:.1} m/s\nThrottle: {:.0}%\nThrust: {:.0} N\nFuel: {:.0} kg",
+        planet.name,
         rocket.current_stage,
         altitude,
+        pitch_deg,
         vel_mag,
+        surface_vel,
+        vertical_vel,
         rocket.throttle * 100.0,
-        if current_fuel > 0.0 { current_thrust } else { 0.0 },
+        current_thrust,
         current_fuel,
-        pitch.to_degrees(),
-        yaw.to_degrees(),
-        roll.to_degrees()
     );
 }
 
