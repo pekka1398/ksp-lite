@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use bevy::input::mouse::{MouseMotion, MouseWheel};
+use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy_rapier3d::prelude::*;
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, States)]
@@ -74,7 +74,7 @@ fn camera_controller(
 ) {
     let dt = time.delta_secs();
 
-    // Process inputs outside the query so they aren't consumed per-camera
+    // Process inputs outside so they aren't consumed per-camera
     let mut kb_yaw_delta = 0.0;
     let mut kb_pitch_delta = 0.0;
     let mut zoom_delta = 0.0;
@@ -109,7 +109,11 @@ fn camera_controller(
 
     // Mouse scroll
     for event in mouse_wheel_events.read() {
-        zoom_delta -= event.y * 2.0;
+        if let MouseScrollUnit::Line = event.unit {
+            zoom_delta -= event.y * 2.0;
+        } else {
+            zoom_delta -= event.y * 0.02;
+        }
     }
 
     // Apply to cameras

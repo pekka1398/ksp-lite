@@ -3,11 +3,8 @@ name = "ksp-lite"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-bevy_rapier3d = "0.33.0"
-
 [dependencies.bevy]
-version = "0.18.1"
+version = "0.15.3"
 default-features = false
 features = [
   "bevy_asset",
@@ -30,5 +27,7 @@ features = [
   "tonemapping_luts",
   "default_font",
   "bevy_gizmos",
-  "zstd_rust",
 ]
+
+[dependencies.bevy_rapier3d]
+version = "0.28.0"
