@@ -31,3 +31,6 @@ features = [
 
 [dependencies.bevy_rapier3d]
 version = "0.28.0"
+
+[dependencies.ordered-float]
+version = "4"
