@@ -31,17 +31,30 @@ struct OrbitCamera {
 }
 
 #[derive(Component)]
-struct ExhaustFlame;
+struct Rocket {
+    is_launched: bool,
+    throttle: f32,
+    current_stage: usize,
+}
 
 #[derive(Component)]
-struct Rocket {
-    throttle: f32,
-    is_launched: bool,
-    max_thrust: f32,
-    fuel_burn_rate: f32,
+struct FuelTank {
     fuel_mass: f32,
     dry_mass: f32,
 }
+
+#[derive(Component)]
+struct Engine {
+    max_thrust: f32,
+    fuel_burn_rate: f32,
+    stage: usize,
+}
+
+#[derive(Component)]
+struct StageMarker(usize);
+
+#[derive(Component)]
+struct ExhaustFlame(usize);
 
 #[derive(Component)]
 struct TelemetryUI;
@@ -80,47 +93,95 @@ fn setup_scene(
     ));
 
     let mat_upper = materials.add(Color::srgb(0.8, 0.8, 0.8));
+    let mat_lower = materials.add(Color::srgb(0.6, 0.6, 0.7));
     let mat_nose = materials.add(Color::srgb(0.9, 0.1, 0.1));
     let mat_engine = materials.add(Color::srgb(0.2, 0.2, 0.2));
     let mat_flame = materials.add(Color::srgb(1.0, 0.5, 0.0));
 
-    // The root vessel entity
-    commands.spawn((
+    // --- STAGE 0 (Upper Stage + Capsule) ---
+    let stage0_entity = commands.spawn((
         Mesh3d(meshes.add(Cylinder::new(0.5, 1.0))),
-        MeshMaterial3d(mat_upper),
-        Transform::from_xyz(0.0, 1.2, 0.0), 
+        MeshMaterial3d(mat_upper.clone()),
+        Transform::from_xyz(0.0, 4.2, 0.0), // Lifted: 2.3 + 1.9 = 4.2
         RigidBody::Dynamic,
         Collider::cylinder(0.5, 0.5),
-        ColliderMassProperties::Mass(1500.0 + 4000.0), // Dry mass + initial fuel
+        ColliderMassProperties::Mass(1500.0 + 1000.0),
         ExternalForce::default(),
         Velocity::default(),
-        Rocket { 
-            throttle: 0.0, 
+        Rocket {
+            throttle: 0.0,
             is_launched: false,
-            max_thrust: 150_000.0, // 150 kN
-            fuel_burn_rate: 45.0, // 45 kg per second at full throttle
-            fuel_mass: 4000.0, // 4 tons of fuel
-            dry_mass: 1500.0, // 1.5 tons of metal 
+            current_stage: 1, // Start with Stage 1 (Booster) active
         },
+        FuelTank {
+            fuel_mass: 1000.0,
+            dry_mass: 1500.0,
+        },
+        Engine {
+            max_thrust: 50_000.0,
+            fuel_burn_rate: 15.0,
+            stage: 0,
+        },
+        StageMarker(0),
     )).with_child((
         Mesh3d(meshes.add(Cone { radius: 0.5, height: 1.0 })),
         MeshMaterial3d(mat_nose),
         Transform::from_xyz(0.0, 1.0, 0.0),
         Collider::cone(0.5, 0.5),
-        ColliderMassProperties::Mass(1.0), // negligible
+        ColliderMassProperties::Mass(1.0),
     )).with_child((
         Mesh3d(meshes.add(ConicalFrustum { radius_top: 0.15, radius_bottom: 0.3, height: 0.4 })),
-        MeshMaterial3d(mat_engine),
+        MeshMaterial3d(mat_engine.clone()),
         Transform::from_xyz(0.0, -0.7, 0.0),
-        Collider::cylinder(0.2, 0.3), 
-        ColliderMassProperties::Mass(1.0), // negligible
+        Collider::cylinder(0.2, 0.3),
+        ColliderMassProperties::Mass(1.0),
     )).with_child((
         Mesh3d(meshes.add(Cone { radius: 0.25, height: 2.0 })),
-        MeshMaterial3d(mat_flame),
+        MeshMaterial3d(mat_flame.clone()),
         Transform::from_xyz(0.0, -1.7, 0.0),
         Visibility::Hidden,
-        ExhaustFlame,
-    ));
+        ExhaustFlame(0),
+    )).id();
+
+    // --- STAGE 1 (Booster) ---
+    let stage1_entity = commands.spawn((
+        Mesh3d(meshes.add(Cylinder::new(0.5, 2.0))),
+        MeshMaterial3d(mat_lower),
+        Transform::from_xyz(0.0, 2.3, 0.0), // Lifted: Booster bottom at 0.5 + engine (0.4nd) clearance
+        RigidBody::Dynamic,
+        Collider::cylinder(1.0, 0.5),
+        ColliderMassProperties::Mass(2000.0 + 3000.0),
+        ExternalForce::default(),
+        Velocity::default(),
+        FuelTank {
+            fuel_mass: 3000.0,
+            dry_mass: 2000.0,
+        },
+        Engine {
+            max_thrust: 150_000.0,
+            fuel_burn_rate: 45.0,
+            stage: 1,
+        },
+        StageMarker(1),
+    )).with_child((
+        Mesh3d(meshes.add(ConicalFrustum { radius_top: 0.25, radius_bottom: 0.5, height: 0.8 })),
+        MeshMaterial3d(mat_engine),
+        Transform::from_xyz(0.0, -1.4, 0.0),
+        Collider::cylinder(0.4, 0.4),
+        ColliderMassProperties::Mass(1.0),
+    )).with_child((
+        Mesh3d(meshes.add(Cone { radius: 0.4, height: 3.0 })),
+        MeshMaterial3d(mat_flame),
+        Transform::from_xyz(0.0, -2.9, 0.0),
+        Visibility::Hidden,
+        ExhaustFlame(1),
+    )).id();
+
+    // Joint them together matching reference logic
+    let joint = FixedJointBuilder::new()
+        .local_anchor1(Vec3::new(0.0, -0.9, 0.0)) // Match reference stage 0 anchor
+        .local_anchor2(Vec3::new(0.0, 1.0, 0.0));  // Match reference stage 1 anchor
+    commands.entity(stage1_entity).insert(ImpulseJoint::new(stage0_entity, joint));
 
     // Camera
     commands.spawn((
@@ -154,91 +215,119 @@ fn setup_scene(
 fn rocket_flight_system(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
-    mut query: Query<(&mut Rocket, &mut ExternalForce, &mut ColliderMassProperties, &Transform)>,
-    mut flame_query: Query<&mut Visibility, With<ExhaustFlame>>,
+    mut commands: Commands,
+    mut rocket_q: Query<(Entity, &mut Rocket, &Transform)>,
+    mut part_q: Query<(Entity, &mut FuelTank, &Engine, &mut ExternalForce, &mut ColliderMassProperties, &Transform)>,
+    mut flame_q: Query<(&mut Visibility, &ExhaustFlame)>,
+    joint_q: Query<(Entity, &ImpulseJoint)>,
 ) {
     let dt = time.delta_secs();
 
-    for (mut rocket, mut ext_force, mut mass_props, transform) in query.iter_mut() {
-        if keys.just_pressed(KeyCode::Space) {
-            rocket.is_launched = true;
-        }
+    let Ok((rocket_entity, mut rocket, _)) = rocket_q.get_single_mut() else { return; };
 
+    // Launch / Stage logic
+    if keys.just_pressed(KeyCode::Space) {
         if !rocket.is_launched {
-            continue;
+            rocket.is_launched = true;
+        } else if rocket.current_stage > 0 {
+            // DECOUPLE
+            // Find the joint connecting TO our rocket_entity or FROM it.
+            // In our setup, stage1_entity had the ImpulseJoint pointing to stage0_entity (rocket_entity).
+            for (joint_entity, joint) in joint_q.iter() {
+                if joint.parent == rocket_entity {
+                    commands.entity(joint_entity).remove::<ImpulseJoint>();
+                    rocket.current_stage -= 1;
+                    break;
+                }
+            }
         }
+    }
 
-        // Throttle control
-        if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
-            rocket.throttle += 0.5 * dt;
-        }
-        if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
-            rocket.throttle -= 0.5 * dt;
-        }
-        if keys.just_pressed(KeyCode::KeyZ) {
-            rocket.throttle = 1.0;
-        }
-        if keys.just_pressed(KeyCode::KeyX) {
-            rocket.throttle = 0.0;
-        }
-        rocket.throttle = rocket.throttle.clamp(0.0, 1.0);
+    if !rocket.is_launched { return; }
 
-        // Burn Fuel and Apply Thrust
-        if rocket.throttle > 0.0 && rocket.fuel_mass > 0.0 {
-            let burnt = rocket.fuel_burn_rate * rocket.throttle * dt;
-            rocket.fuel_mass = (rocket.fuel_mass - burnt).max(0.0);
-            
-            // Adjust physics mass dynamically!
-            *mass_props = ColliderMassProperties::Mass(rocket.dry_mass + rocket.fuel_mass);
+    // Throttle control
+    if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+        rocket.throttle += 0.5 * dt;
+    }
+    if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
+        rocket.throttle -= 0.5 * dt;
+    }
+    if keys.just_pressed(KeyCode::KeyZ) { rocket.throttle = 1.0; }
+    if keys.just_pressed(KeyCode::KeyX) { rocket.throttle = 0.0; }
+    rocket.throttle = rocket.throttle.clamp(0.0, 1.0);
 
-            let thrust = transform.up() * rocket.throttle * rocket.max_thrust;
-            ext_force.force = thrust;
-        } else {
-            // Cut thrust if no fuel
-            ext_force.force = Vec3::ZERO;
-        }
-
-        // Apply WASD Torque for SAS
+    // Apply SAS Torque to the main rocket entity (the command pod/vessel)
+    if let Ok((_, _, _, mut ext_force, _, transform)) = part_q.get_mut(rocket_entity) {
         let mut local_torque = Vec3::ZERO;
         let torque_amount = 8000.0;
-        
         if keys.pressed(KeyCode::KeyW) { local_torque.x += torque_amount; }
         if keys.pressed(KeyCode::KeyS) { local_torque.x -= torque_amount; }
         if keys.pressed(KeyCode::KeyA) { local_torque.z += torque_amount; }
         if keys.pressed(KeyCode::KeyD) { local_torque.z -= torque_amount; }
-
         ext_force.torque = transform.rotation * local_torque;
+    }
 
-        // Flame visibility based on actual propulsion
-        for mut vis in flame_query.iter_mut() {
-            *vis = if rocket.throttle > 0.0 && rocket.fuel_mass > 0.0 { Visibility::Visible } else { Visibility::Hidden };
+    // Process all rocket parts (Engines and Fuel Tanks)
+    for (_entity, mut fuel, engine, mut ext_force, mut mass_props, transform) in part_q.iter_mut() {
+        // Only active stage engine burns
+        if engine.stage == rocket.current_stage && rocket.throttle > 0.0 && fuel.fuel_mass > 0.0 {
+            let burnt = engine.fuel_burn_rate * rocket.throttle * dt;
+            fuel.fuel_mass = (fuel.fuel_mass - burnt).max(0.0);
+
+            // Adjust physics mass
+            *mass_props = ColliderMassProperties::Mass(fuel.dry_mass + fuel.fuel_mass);
+
+            let thrust = transform.up() * rocket.throttle * engine.max_thrust;
+            ext_force.force = thrust;
+        } else {
+            ext_force.force = Vec3::ZERO;
+            // Spent stages still have mass (already handled by mass_props being on the entity)
+        }
+
+        // Update Flame visibility
+        for (mut vis, flame) in flame_q.iter_mut() {
+            if flame.0 == engine.stage {
+                *vis = if engine.stage == rocket.current_stage && rocket.throttle > 0.0 && fuel.fuel_mass > 0.0 {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                };
+            }
         }
     }
 }
 
 fn telemetry_system(
     rocket_q: Query<(&Rocket, &Transform, &Velocity)>,
+    part_q: Query<(&FuelTank, &Engine)>,
     mut text_q: Query<&mut Text, With<TelemetryUI>>,
 ) {
     let Ok((rocket, transform, velocity)) = rocket_q.get_single() else { return; };
     let Ok(mut text) = text_q.get_single_mut() else { return; };
 
-    let planet_center = Vec3::new(0.0, -200.0, 0.0);
-    // Measured altitude = distance from planet center - planet radius
-    let altitude = transform.translation.distance(planet_center) - 200.0;
-    
-    let vel_mag = velocity.linvel.length();
-    let thrust = rocket.throttle * rocket.max_thrust;
+    // Find current active engine/tank stats
+    let mut current_fuel = 0.0;
+    let mut current_thrust = 0.0;
+    for (tank, engine) in part_q.iter() {
+        if engine.stage == rocket.current_stage {
+            current_fuel = tank.fuel_mass;
+            current_thrust = rocket.throttle * engine.max_thrust;
+        }
+    }
 
+    let planet_center = Vec3::new(0.0, -200.0, 0.0);
+    let altitude = transform.translation.distance(planet_center) - 200.0;
+    let vel_mag = velocity.linvel.length();
     let (yaw, pitch, roll) = transform.rotation.to_euler(EulerRot::YXZ);
 
     text.0 = format!(
-        "Altitude: {:.1} m\nVelocity: {:.1} m/s\nThrottle: {:.0}%\nThrust: {:.0} N\nFuel: {:.0} kg\nPitch: {:.1} deg Yaw: {:.1} deg Roll: {:.1} deg",
+        "Stage: {}\nAltitude: {:.1} m\nVelocity: {:.1} m/s\nThrottle: {:.0}%\nThrust: {:.0} N\nFuel: {:.0} kg\nPitch: {:.1} deg Yaw: {:.1} deg Roll: {:.1} deg",
+        rocket.current_stage,
         altitude,
         vel_mag,
         rocket.throttle * 100.0,
-        if rocket.fuel_mass > 0.0 { thrust } else { 0.0 },
-        rocket.fuel_mass,
+        if current_fuel > 0.0 { current_thrust } else { 0.0 },
+        current_fuel,
         pitch.to_degrees(),
         yaw.to_degrees(),
         roll.to_degrees()
