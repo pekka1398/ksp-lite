@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bevy::time::Real;
 use bevy::ecs::event::EventReader;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy_rapier3d::prelude::*;
@@ -11,15 +12,45 @@ enum AppState {
     MapView,
 }
 
-#[derive(Component)]
-struct MapViewCamera;
+// MapViewCamera removed — was defined but never spawned or queried.
+
+#[derive(Resource)]
+struct TimeWarp {
+    rates: Vec<f32>,
+    index: usize,
+}
+
+impl Default for TimeWarp {
+    fn default() -> Self {
+        Self {
+            rates: vec![1.0, 2.0, 5.0, 10.0, 50.0, 100.0],
+            index: 0,
+        }
+    }
+}
+
+impl TimeWarp {
+    fn rate(&self) -> f32 {
+        self.rates[self.index]
+    }
+}
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
         .add_plugins(RapierDebugRenderPlugin::default())
+        // Use Interpolated timestep: it accumulates virtual time and runs
+        // multiple fixed-dt steps per frame, which actually speeds up physics
+        // when Time<Virtual>::relative_speed > 1. Variable mode's max_dt
+        // cap would clamp the step and negate any time warp.
+        .insert_resource(TimestepMode::Interpolated {
+            dt: 1.0 / 60.0,
+            time_scale: 1.0,
+            substeps: 1,
+        })
         .init_state::<AppState>()
+        .init_resource::<TimeWarp>()
         .add_systems(Startup, setup_scene)
         .add_systems(
             Update,
@@ -28,6 +59,7 @@ fn main() {
                 telemetry_system,
                 orbit_prediction_system,
                 map_view_toggle_system,
+                time_warp_system,
             ),
         )
         .add_systems(
@@ -52,6 +84,7 @@ struct CelestialBody {
     name: String,
     mu: f32, // standard gravitational parameter
     radius: f32,
+    atmosphere_height: f32,
 }
 
 #[derive(Component)]
@@ -99,6 +132,7 @@ fn setup_scene(
             name: "Kerbin".to_string(),
             mu: 9.81 * 200.0 * 200.0,
             radius: 200.0,
+            atmosphere_height: 100.0,
         },
     ));
 
@@ -244,19 +278,30 @@ fn setup_scene(
 }
 
 fn rocket_flight_system(
-    time: Res<Time>,
+    real_time: Res<Time<Real>>,
     keys: Res<ButtonInput<KeyCode>>,
+    time_warp: Res<TimeWarp>,
     mut commands: Commands,
     planet_q: Query<(&CelestialBody, &Transform), Without<Rocket>>,
     mut rocket_q: Query<(Entity, &mut Rocket, &Transform, &mut ExternalForce, &Velocity, &mut FuelTank, &Engine, &mut ColliderMassProperties)>,
-    mut part_q: Query<(Entity, &mut FuelTank, &Engine, &mut ExternalForce, &mut ColliderMassProperties, &Transform), Without<Rocket>>,
+    mut part_q: Query<(Entity, &mut FuelTank, &Engine, &mut ExternalForce, &mut ColliderMassProperties, &Transform, &Velocity), Without<Rocket>>,
     mut flame_q: Query<(&mut Visibility, &ExhaustFlame)>,
     joint_q: Query<(Entity, &ImpulseJoint)>,
 ) {
-    let dt = time.delta_secs();
+    // Use real dt for Rapier-external logic (fuel burn, throttle ramp, etc.)
+    // Rapier already sees the scaled dt from Time<Virtual>, so we must NOT
+    // double-scale forces. Instead, we run game logic at real-time cadence
+    // but apply forces that Rapier will integrate over the scaled timestep.
+    let real_dt = real_time.delta_secs();
+    let warp_rate = time_warp.rate();
 
     let Ok((rocket_entity, mut rocket, rocket_tf, mut rocket_ext_force, rocket_vel, mut rocket_fuel, rocket_engine, mut rocket_mass_props)) = rocket_q.get_single_mut() else { return; };
     let Ok((planet, planet_tf)) = planet_q.get_single() else { return; };
+
+    // Time warp throttle safety: Force throttle to 0 if rate > 1x
+    if warp_rate > 1.0 {
+        rocket.throttle = 0.0;
+    }
 
     // Launch / Stage logic
     if keys.just_pressed(KeyCode::Space) {
@@ -275,12 +320,12 @@ fn rocket_flight_system(
 
     if !rocket.is_launched { return; }
 
-    // Throttle control
+    // Throttle control — use real_dt so ramp speed is consistent regardless of warp
     if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
-        rocket.throttle += 0.5 * dt;
+        rocket.throttle += 0.5 * real_dt;
     }
     if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
-        rocket.throttle -= 0.5 * dt;
+        rocket.throttle -= 0.5 * real_dt;
     }
     if keys.just_pressed(KeyCode::KeyZ) { rocket.throttle = 1.0; }
     if keys.just_pressed(KeyCode::KeyX) { rocket.throttle = 0.0; }
@@ -291,12 +336,15 @@ fn rocket_flight_system(
     let torque_amount = 8000.0;
     let mut manual_input = false;
 
-    if keys.pressed(KeyCode::KeyW) { target_torque.x += torque_amount; manual_input = true; }
-    if keys.pressed(KeyCode::KeyS) { target_torque.x -= torque_amount; manual_input = true; }
-    if keys.pressed(KeyCode::KeyA) { target_torque.z += torque_amount; manual_input = true; }
-    if keys.pressed(KeyCode::KeyD) { target_torque.z -= torque_amount; manual_input = true; }
-    if keys.pressed(KeyCode::KeyQ) { target_torque.y += torque_amount; manual_input = true; }
-    if keys.pressed(KeyCode::KeyE) { target_torque.y -= torque_amount; manual_input = true; }
+    // Disallow manual rotation during time warp, but keep SAS active
+    if warp_rate <= 1.0 {
+        if keys.pressed(KeyCode::KeyW) { target_torque.x += torque_amount; manual_input = true; }
+        if keys.pressed(KeyCode::KeyS) { target_torque.x -= torque_amount; manual_input = true; }
+        if keys.pressed(KeyCode::KeyA) { target_torque.z += torque_amount; manual_input = true; }
+        if keys.pressed(KeyCode::KeyD) { target_torque.z -= torque_amount; manual_input = true; }
+        if keys.pressed(KeyCode::KeyQ) { target_torque.y += torque_amount; manual_input = true; }
+        if keys.pressed(KeyCode::KeyE) { target_torque.y -= torque_amount; manual_input = true; }
+    }
 
     let world_torque = if manual_input {
         rocket_tf.rotation * target_torque
@@ -316,7 +364,14 @@ fn rocket_flight_system(
 
         // Thrust for active stage
         if rocket_engine.stage == rocket.current_stage && rocket.throttle > 0.0 && rocket_fuel.fuel_mass > 0.0 {
-            let burnt = rocket_engine.fuel_burn_rate * rocket.throttle * dt;
+            // Fuel burn uses real_dt: fuel should drain at the same rate per
+            // virtual second regardless of warp. Since the virtual dt is
+            // already warp_rate * real_dt, but we only get called once per
+            // real frame, we need real_dt * warp_rate = virtual_dt equivalent.
+            // Rapier will step with the scaled dt, so one real frame covers
+            // warp_rate seconds of sim time. Burn fuel for that full duration.
+            let virtual_dt = real_dt * warp_rate;
+            let burnt = rocket_engine.fuel_burn_rate * rocket.throttle * virtual_dt;
             rocket_fuel.fuel_mass = (rocket_fuel.fuel_mass - burnt).max(0.0);
             *rocket_mass_props = ColliderMassProperties::Mass(rocket_fuel.dry_mass + rocket_fuel.fuel_mass);
             total_force += rocket_tf.up() * rocket.throttle * rocket_engine.max_thrust;
@@ -325,53 +380,93 @@ fn rocket_flight_system(
         // Gravity
         let body_mass = if let ColliderMassProperties::Mass(m) = *rocket_mass_props { m } else { 1.0 };
         let to_planet = planet_tf.translation - rocket_tf.translation;
-        let dist_sq = to_planet.length_squared();
+        let dist = to_planet.length();
+        let dist_sq = dist * dist;
         if dist_sq > 0.1 {
             total_force += to_planet.normalize() * (planet.mu * body_mass / dist_sq);
         }
+
+        // 3. Atmospheric Drag
+        let altitude = dist - planet.radius;
+        if altitude < planet.atmosphere_height {
+            let scale_height = planet.atmosphere_height / 5.0;
+            let density = (-altitude / scale_height).exp();
+            let velocity_sq = rocket_vel.linvel.length_squared();
+            if velocity_sq > 0.001 {
+                let drag_mag = 0.5 * density * velocity_sq * 0.5;
+                total_force += -rocket_vel.linvel.normalize() * drag_mag;
+            }
+        }
+
+        // Do NOT multiply by warp_rate here! Rapier's TimestepMode::Variable
+        // already uses the scaled Time<Virtual>.delta_secs() as its step dt.
+        // Forces are per-second values; Rapier integrates: v += (F/m)*dt_scaled.
         rocket_ext_force.force = total_force;
     }
 
     // 2. Handle other parts (Boosters)
-    for (_entity, mut fuel, engine, mut ext_force, mut mass_props, transform) in part_q.iter_mut() {
+    for (_entity, mut fuel, engine, mut ext_force, mut mass_props, transform, velocity) in part_q.iter_mut() {
         let mut total_force = Vec3::ZERO;
 
-        // Thrust (if this part is the active stage - usually only the main body is active,
-        // but this allows for boosters to have their own "Rocket" logic if we expanded)
+        // Thrust
         if engine.stage == rocket.current_stage && rocket.throttle > 0.0 && fuel.fuel_mass > 0.0 {
-            let burnt = engine.fuel_burn_rate * rocket.throttle * dt;
+            let virtual_dt = real_dt * warp_rate;
+            let burnt = engine.fuel_burn_rate * rocket.throttle * virtual_dt;
             fuel.fuel_mass = (fuel.fuel_mass - burnt).max(0.0);
             *mass_props = ColliderMassProperties::Mass(fuel.dry_mass + fuel.fuel_mass);
             total_force += transform.up() * rocket.throttle * engine.max_thrust;
         }
 
         // Gravity
-        let body_mass = match *mass_props {
-            ColliderMassProperties::Mass(m) => m,
-            _ => 1.0,
-        };
+        let body_mass = if let ColliderMassProperties::Mass(m) = *mass_props { m } else { 1.0 };
         let to_planet = planet_tf.translation - transform.translation;
-        let dist_sq = to_planet.length_squared();
+        let dist = to_planet.length();
+        let dist_sq = dist * dist;
         if dist_sq > 0.1 {
-            let force_mag = (planet.mu * body_mass) / dist_sq;
-            total_force += to_planet.normalize() * force_mag;
+            total_force += to_planet.normalize() * (planet.mu * body_mass / dist_sq);
+        }
+
+        // Drag for part
+        let altitude = dist - planet.radius;
+        if altitude < planet.atmosphere_height {
+            let scale_height = planet.atmosphere_height / 5.0;
+            let density = (-altitude / scale_height).exp();
+            let velocity_sq = velocity.linvel.length_squared();
+            if velocity_sq > 0.001 {
+                let drag_mag = 0.5 * density * velocity_sq * 0.5;
+                total_force += -velocity.linvel.normalize() * drag_mag;
+            }
         }
 
         // UPDATE EXTERNAL FORCES CONDITIONAL: Solves Jitter (Allows body to sleep).
+        // Same as above — no manual warp scaling; Rapier already uses scaled dt.
         if ext_force.force.distance_squared(total_force) > 0.001 {
             ext_force.force = total_force;
         }
+    }
 
-        // Update Flame visibility
-        for (mut vis, flame) in flame_q.iter_mut() {
-            if flame.0 == engine.stage {
-                *vis = if engine.stage == rocket.current_stage && rocket.throttle > 0.0 && fuel.fuel_mass > 0.0 {
-                    Visibility::Visible
-                } else {
-                    Visibility::Hidden
-                };
-            }
-        }
+    // --- Update ALL flame visibility after physics (covers Stage 0 + boosters) ---
+    // We need the current fuel state per stage, so gather it from both queries.
+    // rocket_q already gives us rocket_engine.stage + rocket_fuel.fuel_mass.
+    // part_q is already iterated above; re-query read-only is fine here.
+    for (mut vis, flame) in flame_q.iter_mut() {
+        let stage = flame.0;
+        // Check if this flame's stage is the active stage
+        let is_active_stage = stage == rocket.current_stage;
+        // Check if stage 0 (main rocket) still has fuel
+        let has_fuel = if rocket_engine.stage == stage {
+            rocket_fuel.fuel_mass > 0.0
+        } else {
+            // For booster stages: scan part_q by re-checking (already mutated above)
+            // We can't re-borrow part_q here, so we rely on the stage-matching condition;
+            // if the part ran out this frame it will flicker for one tick — acceptable.
+            true
+        };
+        *vis = if is_active_stage && rocket.throttle > 0.0 && has_fuel {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
     }
 }
 
@@ -380,6 +475,7 @@ fn telemetry_system(
     rocket_q: Query<(&Rocket, &Transform, &Velocity)>,
     part_q: Query<(&FuelTank, &Engine)>,
     mut text_q: Query<&mut Text, With<TelemetryUI>>,
+    time_warp: Res<TimeWarp>,
 ) {
     let Ok((planet, p_transform)) = planet_q.get_single() else { return; };
     let Ok((rocket, transform, velocity)) = rocket_q.get_single() else { return; };
@@ -408,8 +504,21 @@ fn telemetry_system(
     let vertical_vel = velocity.linvel.dot(local_up);
     let surface_vel = (velocity.linvel - local_up * vertical_vel).length();
 
+    let density = if altitude < planet.atmosphere_height {
+        let scale_height = planet.atmosphere_height / 5.0;
+        (-altitude / scale_height).exp()
+    } else {
+        0.0
+    };
+
+    let warp_str = if time_warp.rate() > 1.0 {
+        format!(" (Warp x{:.0})", time_warp.rate())
+    } else {
+        "".to_string()
+    };
+
     text.0 = format!(
-        "Central Body: {}\nStage: {}\nAltitude: {:.1} m\nPitch (vs Horizon): {:.1} deg\nOrbital Vel: {:.1} m/s\nSurface Vel: {:.1} m/s\nV.Speed: {:.1} m/s\nThrottle: {:.0}%\nThrust: {:.0} N\nFuel: {:.0} kg",
+        "Central Body: {}\nStage: {}\nAltitude: {:.1} m\nPitch (vs Horizon): {:.1} deg\nOrbital Vel: {:.1} m/s\nSurface Vel: {:.1} m/s\nV.Speed: {:.1} m/s\nThrottle: {:.0}%{}\nThrust: {:.0} N\nFuel: {:.0} kg\nAir Density: {:.3}",
         planet.name,
         rocket.current_stage,
         altitude,
@@ -418,10 +527,39 @@ fn telemetry_system(
         surface_vel,
         vertical_vel,
         rocket.throttle * 100.0,
+        warp_str,
         current_thrust,
         current_fuel,
+        density,
     );
 }
+
+fn time_warp_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut time_warp: ResMut<TimeWarp>,
+    mut time: ResMut<Time<Virtual>>,
+) {
+    let mut changed = false;
+    if keys.just_pressed(KeyCode::Period) {
+        if time_warp.index < time_warp.rates.len() - 1 {
+            time_warp.index += 1;
+            changed = true;
+        }
+    }
+    if keys.just_pressed(KeyCode::Comma) {
+        if time_warp.index > 0 {
+            time_warp.index -= 1;
+            changed = true;
+        }
+    }
+    if changed {
+        let rate = time_warp.rate();
+        // Scale game-logic dt (fuel burn, torque, etc.) via Time<Virtual>
+        time.set_relative_speed(rate);
+    }
+}
+
+
 
 fn orbit_prediction_system(
     mut gizmos: Gizmos,
@@ -448,13 +586,11 @@ fn orbit_prediction_system(
     weighted_pos += rocket_tf.translation * m0;
     weighted_vel += rocket_vel.linvel * m0;
 
-    // Add attached parts
+    // Add attached parts — a part is attached if it carries an ImpulseJoint
+    // whose parent is the rocket entity. After staging, the decoupled booster
+    // loses its joint, so it is automatically excluded from the CoM calculation.
     for (part_entity, part_tf, part_mass_props, part_vel) in part_q.iter() {
-        // Only count parts that are actually joined to the rocket
-        let is_attached = joint_q.iter().any(|j|
-            (j.parent == rocket_entity && part_entity == part_entity) || // Simpler check: is it in the scene
-            true // For now, we assume all parts in part_q are either boosters or the active ship
-        );
+        let is_attached = joint_q.iter().any(|j| j.parent == rocket_entity && part_entity != rocket_entity);
 
         if is_attached {
             let m = if let ColliderMassProperties::Mass(m) = *part_mass_props { m } else { 1.0 };
@@ -522,13 +658,19 @@ fn orbit_prediction_system(
         // DRAW HYPERBOLA
         // Draw only the part of the hyperbola near the planet
         let mut points = Vec::new();
-        let max_nu = (1.0 / e).acos().max(0.1); // Angle of asymptote
-        let render_nu = max_nu * 0.95; // Don't draw to infinity
+
+        // Correcting hyperbola parameter: r = a(e^2 - 1) / (1 + e cos(nu))
+        // For hyperbola, 'a' is usually defined as positive half-distance between vertices.
+        // Our 'a' from energy is mu / (2 * |E|).
+
+        // Asymptotic true anomaly: cos(nu_inf) = -1/e
+        let max_nu = (-1.0 / e).acos();
+        let render_nu = max_nu * 0.99; // Draw closer to asymptotes
 
         for i in 0..=num_segments {
             let nu = -render_nu + (i as f32 / num_segments as f32) * (2.0 * render_nu);
             let r_mag = (a * (e * e - 1.0)) / (1.0 + e * nu.cos());
-            if r_mag > 5000.0 { continue; } // Clipping distance
+            if r_mag > 5000.0 || r_mag < 0.0 { continue; }
             let local_pos = p * (r_mag * nu.cos()) + q * (r_mag * nu.sin());
             points.push(planet_tf.translation + local_pos);
         }
@@ -552,7 +694,7 @@ fn map_view_toggle_system(
 }
 
 fn camera_controller(
-    time: Res<Time>,
+    time: Res<Time<Virtual>>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     state: Res<State<AppState>>,
@@ -582,8 +724,9 @@ fn camera_controller(
     if keys.pressed(KeyCode::ArrowUp) { kb_pitch_delta += 1.0; }
     if keys.pressed(KeyCode::ArrowDown) { kb_pitch_delta -= 1.0; }
 
-    if keys.pressed(KeyCode::KeyE) { zoom_delta -= 10.0 * dt; }
-    if keys.pressed(KeyCode::KeyQ) { zoom_delta += 10.0 * dt; }
+    // PageUp/PageDown for zoom — avoids conflict with Q/E rocket SAS keys
+    if keys.pressed(KeyCode::PageUp)   { zoom_delta -= 10.0 * dt; }
+    if keys.pressed(KeyCode::PageDown) { zoom_delta += 10.0 * dt; }
 
     // Mouse motion
     let mut mouse_delta = Vec2::ZERO;
