@@ -18,7 +18,13 @@ fn main() {
         .add_plugins(RapierDebugRenderPlugin::default())
         .init_state::<AppState>()
         .add_systems(Startup, setup_scene)
-        .add_systems(Update, (camera_controller, rocket_flight_system, telemetry_system))
+        .add_systems(Update, (rocket_flight_system, telemetry_system))
+        .add_systems(
+            PostUpdate,
+            camera_controller
+                .after(PhysicsSet::Writeback)
+                .before(TransformSystem::TransformPropagate),
+        )
         .run();
 }
 
@@ -102,7 +108,7 @@ fn setup_scene(
     let stage0_entity = commands.spawn((
         Mesh3d(meshes.add(Cylinder::new(0.5, 1.0))),
         MeshMaterial3d(mat_upper.clone()),
-        Transform::from_xyz(0.0, 4.2, 0.0), // Lifted: 2.3 + 1.9 = 4.2
+        Transform::from_xyz(0.0, 4.25, 0.0), // Lifted: 2.3 + 1.95 = 4.25
         RigidBody::Dynamic,
         Collider::cylinder(0.5, 0.5),
         ColliderMassProperties::Mass(1500.0 + 1000.0),
@@ -179,7 +185,7 @@ fn setup_scene(
 
     // Joint them together matching reference logic
     let joint = FixedJointBuilder::new()
-        .local_anchor1(Vec3::new(0.0, -0.9, 0.0)) // Match reference stage 0 anchor
+        .local_anchor1(Vec3::new(0.0, -0.95, 0.0)) // Match reference stage 0 anchor
         .local_anchor2(Vec3::new(0.0, 1.0, 0.0));  // Match reference stage 1 anchor
     commands.entity(stage1_entity).insert(ImpulseJoint::new(stage0_entity, joint));
 
