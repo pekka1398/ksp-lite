@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy_rapier3d::prelude::*;
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, States)]
@@ -66,38 +67,67 @@ fn setup_scene(
 fn camera_controller(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    mut mouse_motion_events: EventReader<MouseMotion>,
+    mut mouse_wheel_events: EventReader<MouseWheel>,
     mut query: Query<(&mut Transform, &mut OrbitCamera)>,
 ) {
+    let dt = time.delta_secs();
+
+    // Process inputs outside the query so they aren't consumed per-camera
+    let mut kb_yaw_delta = 0.0;
+    let mut kb_pitch_delta = 0.0;
+    let mut zoom_delta = 0.0;
+
+    // Keyboard rotation
+    if keys.pressed(KeyCode::ArrowLeft) || keys.pressed(KeyCode::KeyA) {
+        kb_yaw_delta += 1.0;
+    }
+    if keys.pressed(KeyCode::ArrowRight) || keys.pressed(KeyCode::KeyD) {
+        kb_yaw_delta -= 1.0;
+    }
+    if keys.pressed(KeyCode::ArrowUp) || keys.pressed(KeyCode::KeyW) {
+        kb_pitch_delta += 1.0;
+    }
+    if keys.pressed(KeyCode::ArrowDown) || keys.pressed(KeyCode::KeyS) {
+        kb_pitch_delta -= 1.0;
+    }
+
+    // Keyboard zoom
+    if keys.pressed(KeyCode::KeyE) {
+        zoom_delta -= 10.0 * dt;
+    }
+    if keys.pressed(KeyCode::KeyQ) {
+        zoom_delta += 10.0 * dt;
+    }
+
+    // Mouse motion
+    let mut mouse_delta = Vec2::ZERO;
+    for event in mouse_motion_events.read() {
+        mouse_delta += event.delta;
+    }
+
+    // Mouse scroll
+    for event in mouse_wheel_events.read() {
+        zoom_delta -= event.y * 2.0;
+    }
+
+    // Apply to cameras
     for (mut transform, mut orbit) in query.iter_mut() {
-        let mut yaw_delta = 0.0;
-        let mut pitch_delta = 0.0;
-        let mut dist_delta = 0.0;
+        // Apply keyboard rotation (dt scaled)
+        orbit.yaw += kb_yaw_delta * dt * 2.0;
+        orbit.pitch += kb_pitch_delta * dt * 2.0;
 
-        if keys.pressed(KeyCode::ArrowLeft) || keys.pressed(KeyCode::KeyA) {
-            yaw_delta += 1.0;
-        }
-        if keys.pressed(KeyCode::ArrowRight) || keys.pressed(KeyCode::KeyD) {
-            yaw_delta -= 1.0;
-        }
-        if keys.pressed(KeyCode::ArrowUp) || keys.pressed(KeyCode::KeyW) {
-            pitch_delta += 1.0;
-        }
-        if keys.pressed(KeyCode::ArrowDown) || keys.pressed(KeyCode::KeyS) {
-            pitch_delta -= 1.0;
-        }
-        if keys.pressed(KeyCode::KeyE) {
-            dist_delta -= 1.0;
-        }
-        if keys.pressed(KeyCode::KeyQ) {
-            dist_delta += 1.0;
+        // Apply mouse rotation (unscaled, relies on frame delta pixels)
+        if mouse_buttons.pressed(MouseButton::Right) {
+            orbit.yaw -= mouse_delta.x * 0.005;
+            orbit.pitch -= mouse_delta.y * 0.005;
         }
 
-        let dt = time.delta_secs();
-        orbit.yaw += yaw_delta * dt * 2.0;
-        orbit.pitch += pitch_delta * dt * 2.0;
         orbit.pitch = orbit.pitch.clamp(-1.5, 1.5); // Prevent flipping
-        orbit.distance += dist_delta * dt * 10.0;
-        orbit.distance = orbit.distance.max(2.0);
+        
+        orbit.distance += zoom_delta;
+        orbit.distance = orbit.distance.clamp(2.0, 100.0);
 
         // Calculate new position
         let rotation = Quat::from_euler(EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
