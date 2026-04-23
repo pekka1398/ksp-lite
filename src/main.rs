@@ -246,12 +246,14 @@ fn setup_scene(
     let kerbin_radius = 2000.0;
     let kerbin_g = 5.0;
     let kerbin_mu = kerbin_g * kerbin_radius * kerbin_radius; // 20,000,000
+    // Rotation to make local +Y point along world +X (radially outward at equator)
+    let equator_rot = Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
 
     // Planet (Sphere) — Kerbin
     commands.spawn((
         Mesh3d(meshes.add(Sphere::new(kerbin_radius))),
         MeshMaterial3d(materials.add(Color::srgb(0.2, 0.6, 0.4))),
-        Transform::from_xyz(0.0, -kerbin_radius, 0.0),
+        Transform::from_xyz(0.0, 0.0, 0.0),
         Collider::ball(kerbin_radius),
         RigidBody::Fixed,
         CelestialBody {
@@ -289,11 +291,11 @@ fn setup_scene(
         },
     ));
 
-    // Launch Pad
+    // Launch Pad — on the equator at +X
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(6.0, 0.5, 6.0))),
         MeshMaterial3d(materials.add(Color::srgb(0.3, 0.3, 0.3))),
-        Transform::from_xyz(0.0, 0.25, 0.0),
+        Transform::from_xyz(kerbin_radius + 0.25, 0.0, 0.0).with_rotation(equator_rot),
         RigidBody::Fixed,
         Collider::cuboid(3.0, 0.25, 3.0),
     ));
@@ -329,7 +331,7 @@ fn setup_scene(
     let stage0_entity = commands.spawn((
         Mesh3d(meshes.add(Cylinder::new(0.5, 1.0))),
         MeshMaterial3d(mat_upper.clone()),
-        Transform::from_xyz(0.0, 4.25, 0.0),
+        Transform::from_xyz(kerbin_radius + 4.25, 0.0, 0.0).with_rotation(equator_rot),
         RigidBody::Dynamic,
         GravityScale(0.0),
         Collider::cylinder(0.5, 0.5),
@@ -375,7 +377,7 @@ fn setup_scene(
     let stage1_entity = commands.spawn((
         Mesh3d(meshes.add(Cylinder::new(0.5, 2.0))),
         MeshMaterial3d(mat_lower),
-        Transform::from_xyz(0.0, 2.3, 0.0),
+        Transform::from_xyz(kerbin_radius + 2.3, 0.0, 0.0).with_rotation(equator_rot),
         RigidBody::Dynamic,
         GravityScale(0.0),
         Collider::cylinder(1.0, 0.5),
@@ -415,7 +417,7 @@ fn setup_scene(
     // Camera
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(0.0, 5.0, 15.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(kerbin_radius + 5.0, 5.0, 15.0).looking_at(Vec3::new(kerbin_radius, 0.0, 0.0), Vec3::Y),
         OrbitCamera {
             distance: 20.0,
             pitch: 0.2,
@@ -1149,14 +1151,18 @@ fn camera_controller(
 ) {
     let dt = real_time.delta_secs();
 
-    // Focus target depends on state
-    let target_pos = if *state.get() == AppState::MapView {
-        // In MapView, focus on the SOI body
+    // Focus target and up direction depend on state
+    let (target_pos, up_dir) = if *state.get() == AppState::MapView {
+        // In MapView, focus on the SOI body, up = Y (looking down at orbital plane)
         let rocket_pos = rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
         let (_, body_tf) = find_soi_body(rocket_pos, planet_query.iter());
-        body_tf.translation
+        (body_tf.translation, Vec3::Y)
     } else {
-        rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO)
+        // In Flight, focus on rocket, up = radially outward from planet
+        let rocket_pos = rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
+        let (_, body_tf) = find_soi_body(rocket_pos, planet_query.iter());
+        let up = (rocket_pos - body_tf.translation).try_normalize().unwrap_or(Vec3::Y);
+        (rocket_pos, up)
     };
 
     // Process inputs outside so they aren't consumed per-camera
@@ -1225,10 +1231,13 @@ fn camera_controller(
         orbit.distance = orbit.distance.clamp(min_dist, max_dist);
 
         // Calculate new position
-        let rotation = Quat::from_euler(EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
+        // Align the Y-up orbit rotation to the local up direction
+        let align = Quat::from_rotation_arc(Vec3::Y, up_dir);
+        let local_rot = Quat::from_euler(EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
+        let rotation = align * local_rot;
         let position = target_pos + rotation * Vec3::new(0.0, 0.0, orbit.distance);
 
         transform.translation = position;
-        transform.look_at(target_pos, Vec3::Y);
+        transform.look_at(target_pos, up_dir);
     }
 }
