@@ -4,6 +4,7 @@ use bevy::time::Real;
 use bevy::ecs::event::EventReader;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::core_pipeline::Skybox;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy_rapier3d::prelude::*;
 
 mod vab;
@@ -147,6 +148,9 @@ pub struct OrbitAngle(pub f32);
 pub struct OrbitParent(pub Entity);
 
 #[derive(Component)]
+pub struct OrbitInclination(pub f32);
+
+#[derive(Component)]
 struct SunLight;
 
 #[derive(Component)]
@@ -224,10 +228,12 @@ fn setup_scene(
 ) {
     let kerbin_mu = constants::KERBIN_SURFACE_GRAVITY * constants::KERBIN_RADIUS * constants::KERBIN_RADIUS;
 
+    // Rotate mesh so Bevy's UV sphere +Z pole aligns with world +Y (our north)
+    let kerbin_pole_rot = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
     let kerbin_entity = commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(constants::KERBIN_RADIUS).mesh().ico(8).unwrap())),
-        MeshMaterial3d(materials.add(Color::srgb(0.2, 0.6, 0.4))),
-        Transform::from_xyz(0.0, 0.0, 0.0),
+        Mesh3d(meshes.add(Sphere::new(constants::KERBIN_RADIUS).mesh().uv(32, 18))),
+        MeshMaterial3d(materials.add(generate_kerbin_material(&mut images))),
+        Transform::from_xyz(0.0, 0.0, 0.0).with_rotation(kerbin_pole_rot),
         Collider::ball(constants::KERBIN_RADIUS),
         RigidBody::Fixed,
         CelestialBody {
@@ -246,9 +252,9 @@ fn setup_scene(
     let mun_orbital_speed = f32::sqrt(kerbin_mu / constants::MUN_ORBIT_RADIUS);
     let mun_angular_speed = mun_orbital_speed / constants::MUN_ORBIT_RADIUS;
     commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(constants::MUN_RADIUS).mesh().ico(6).unwrap())),
-        MeshMaterial3d(materials.add(Color::srgb(0.5, 0.5, 0.5))),
-        Transform::from_xyz(constants::MUN_ORBIT_RADIUS, 0.0, 0.0),
+        Mesh3d(meshes.add(Sphere::new(constants::MUN_RADIUS).mesh().uv(24, 12))),
+        MeshMaterial3d(materials.add(generate_mun_material(&mut images))),
+        Transform::from_xyz(constants::MUN_ORBIT_RADIUS, 0.0, 0.0).with_rotation(kerbin_pole_rot),
         Collider::ball(constants::MUN_RADIUS),
         RigidBody::KinematicPositionBased,
         CelestialBody {
@@ -263,6 +269,34 @@ fn setup_scene(
         },
         OrbitAngle(0.0),
         OrbitParent(kerbin_entity),
+    ));
+
+    // Minmus — small, distant, inclined orbit
+    let minmus_mu = constants::MINMUS_SURFACE_GRAVITY * constants::MINMUS_RADIUS * constants::MINMUS_RADIUS;
+    let minmus_orbital_speed = f32::sqrt(kerbin_mu / constants::MINMUS_ORBIT_RADIUS);
+    let minmus_angular_speed = minmus_orbital_speed / constants::MINMUS_ORBIT_RADIUS;
+    let minmus_inclination = constants::MINMUS_INCLINATION_DEG.to_radians();
+    // Start at ascending node (inclined orbit, initial angle = 0)
+    let minmus_start = Quat::from_rotation_z(minmus_inclination) * Vec3::new(constants::MINMUS_ORBIT_RADIUS, 0.0, 0.0);
+    commands.spawn((
+        Mesh3d(meshes.add(Sphere::new(constants::MINMUS_RADIUS).mesh().ico(5).unwrap())),
+        MeshMaterial3d(materials.add(Color::srgb(0.55, 0.7, 0.5))),
+        Transform::from_translation(minmus_start),
+        Collider::ball(constants::MINMUS_RADIUS),
+        RigidBody::KinematicPositionBased,
+        CelestialBody {
+            name: "Minmus".to_string(),
+            mu: minmus_mu,
+            radius: constants::MINMUS_RADIUS,
+            atmosphere_height: 0.0,
+            soi_radius: constants::MINMUS_SOI_RADIUS,
+            orbit_radius: constants::MINMUS_ORBIT_RADIUS,
+            orbit_speed: minmus_angular_speed,
+            rotation_speed: 0.0,
+        },
+        OrbitAngle(0.0),
+        OrbitParent(kerbin_entity),
+        OrbitInclination(minmus_inclination),
     ));
 
     // Sun — orbits Kerbin in ECI frame, angular speed matches Kerbin rotation for day/night
@@ -325,6 +359,219 @@ fn setup_scene(
             rotation: Quat::IDENTITY,
         },
     ));
+}
+
+// ===== Procedural Kerbin Texture =====
+
+fn generate_kerbin_material(images: &mut Assets<Image>) -> StandardMaterial {
+    let w = 512u32;
+    let h = 256u32;
+    let mut data = vec![0u8; (w * h * 4) as usize];
+
+    for py in 0..h {
+        for px in 0..w {
+            let u = px as f32 / w as f32;
+            let v = py as f32 / h as f32;
+
+            // Bevy UV sphere: v=0 → +Z pole, u → angle in XY
+            let stack_angle = std::f32::consts::FRAC_PI_2 - v * std::f32::consts::PI;
+            let sector_angle = u * std::f32::consts::TAU;
+            let dir = Vec3::new(
+                stack_angle.cos() * sector_angle.cos(),
+                stack_angle.cos() * sector_angle.sin(),
+                stack_angle.sin(),
+            );
+
+            // Latitude from mesh Z-axis (pole), now rotated to match world +Y
+            let lat = dir.z.asin();
+
+            // Multi-octave value noise on 3D position
+            let n = fbm(dir * 2.5, 5);
+
+            // Polar ice
+            let polar = (lat.abs() - 1.1).max(0.0) * 5.0;
+
+            let (r, g, b) = if polar > 0.5 || n > 0.62 {
+                // Land / ice (~30% of surface)
+                if polar > 0.5 {
+                    // Ice caps
+                    let t = polar.min(1.0);
+                    (200 + (55.0 * t) as u8, 210 + (45.0 * t) as u8, 220 + (35.0 * t) as u8)
+                } else if n > 0.78 {
+                    // Mountains / highlands
+                    let t = ((n - 0.78) / 0.22).min(1.0);
+                    (100 + (50.0 * t) as u8, 85 + (40.0 * t) as u8, 55 + (30.0 * t) as u8)
+                } else {
+                    // Lowland green
+                    let t = (n - 0.62) / 0.16;
+                    (35 + (40.0 * t) as u8, 110 + (50.0 * t) as u8, 45 + (20.0 * t) as u8)
+                }
+            } else if n > 0.55 {
+                // Coast / shallow water
+                let t = (n - 0.55) / 0.07;
+                (30 + (25.0 * t) as u8, 80 + (60.0 * t) as u8, 140 + (20.0 * t) as u8)
+            } else {
+                // Deep ocean (~70% of surface)
+                let depth = n / 0.55;
+                (15 + (15.0 * depth) as u8, 40 + (40.0 * depth) as u8, 100 + (50.0 * depth) as u8)
+            };
+
+            let idx = (py * w + px) as usize * 4;
+            data[idx] = r;
+            data[idx + 1] = g;
+            data[idx + 2] = b;
+            data[idx + 3] = 255;
+        }
+    }
+
+    let image = Image::new(
+        Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        bevy::asset::RenderAssetUsages::RENDER_WORLD | bevy::asset::RenderAssetUsages::MAIN_WORLD,
+    );
+
+    StandardMaterial {
+        base_color_texture: Some(images.add(image)),
+        perceptual_roughness: 0.85,
+        ..default()
+    }
+}
+
+fn generate_mun_material(images: &mut Assets<Image>) -> StandardMaterial {
+    let w = 512u32;
+    let h = 256u32;
+    let mut data = vec![0u8; (w * h * 4) as usize];
+
+    // Pre-generate crater centers using hash-based positions
+    // Each crater: (direction on unit sphere, radius)
+    let crater_seeds: Vec<(Vec3, f32)> = (0..80).map(|i| {
+        let theta = hash3(i * 7, i * 13, i * 3) * std::f32::consts::TAU;
+        let phi = (hash3(i * 11, i * 17, i * 5) * 2.0 - 1.0).asin();
+        let dir = Vec3::new(
+            phi.cos() * theta.cos(),
+            phi.cos() * theta.sin(),
+            phi.sin(),
+        );
+        let radius = 0.05 + hash3(i * 19, i * 23, i * 29) * 0.2;
+        (dir, radius)
+    }).collect();
+
+    for py in 0..h {
+        for px in 0..w {
+            let u = px as f32 / w as f32;
+            let v = py as f32 / h as f32;
+
+            let stack_angle = std::f32::consts::FRAC_PI_2 - v * std::f32::consts::PI;
+            let sector_angle = u * std::f32::consts::TAU;
+            let dir = Vec3::new(
+                stack_angle.cos() * sector_angle.cos(),
+                stack_angle.cos() * sector_angle.sin(),
+                stack_angle.sin(),
+            );
+
+            // Base surface: subtle noise variation
+            let base = 0.45 + fbm(dir * 4.0, 4) * 0.15;
+
+            // Crater contribution
+            let mut crater_val = 0.0;
+            for (c_dir, c_r) in &crater_seeds {
+                let dot = dir.dot(*c_dir);
+                if dot < 0.0 { continue; }
+                let ang = dot.acos();
+                if ang < *c_r {
+                    let t = ang / c_r;
+                    // Bowl shape: dip in center, raised rim
+                    if t < 0.7 {
+                        crater_val -= 0.15 * (1.0 - t / 0.7);
+                    } else {
+                        crater_val += 0.08 * ((t - 0.7) / 0.3).min(1.0);
+                    }
+                }
+            }
+
+            let val = (base + crater_val).clamp(0.15, 0.75);
+            let grey = (val * 255.0) as u8;
+            // Slight warm tint for highlands, cool for low
+            let r = (grey as f32 * 1.05).min(255.0) as u8;
+            let g = grey;
+            let b = (grey as f32 * 0.95).min(255.0) as u8;
+
+            let idx = (py * w + px) as usize * 4;
+            data[idx] = r;
+            data[idx + 1] = g;
+            data[idx + 2] = b;
+            data[idx + 3] = 255;
+        }
+    }
+
+    let image = Image::new(
+        Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        bevy::asset::RenderAssetUsages::RENDER_WORLD | bevy::asset::RenderAssetUsages::MAIN_WORLD,
+    );
+
+    StandardMaterial {
+        base_color_texture: Some(images.add(image)),
+        perceptual_roughness: 0.95,
+        ..default()
+    }
+}
+
+/// Simple hash-based value noise on 3D integer grid.
+fn hash3(x: i32, y: i32, z: i32) -> f32 {
+    let mut h = (x as u32).wrapping_mul(374761393)
+        .wrapping_add((y as u32).wrapping_mul(668265263))
+        .wrapping_add((z as u32).wrapping_mul(1274126177));
+    h = (h ^ (h >> 13)).wrapping_mul(1274126177);
+    h = (h ^ (h >> 16)).wrapping_mul(668265263);
+    h as f32 / u32::MAX as f32
+}
+
+/// Smooth value noise with trilinear interpolation.
+fn vnoise(p: Vec3) -> f32 {
+    let ix = p.x.floor() as i32;
+    let iy = p.y.floor() as i32;
+    let iz = p.z.floor() as i32;
+    let fx = p.x - ix as f32;
+    let fy = p.y - iy as f32;
+    let fz = p.z - iz as f32;
+    // Smoothstep
+    let sx = fx * fx * (3.0 - 2.0 * fx);
+    let sy = fy * fy * (3.0 - 2.0 * fy);
+    let sz = fz * fz * (3.0 - 2.0 * fz);
+
+    let mut acc = 0.0;
+    for dz in 0..=1i32 {
+        for dy in 0..=1i32 {
+            for dx in 0..=1i32 {
+                let v = hash3(ix + dx, iy + dy, iz + dz);
+                let wx = if dx == 0 { 1.0 - sx } else { sx };
+                let wy = if dy == 0 { 1.0 - sy } else { sy };
+                let wz = if dz == 0 { 1.0 - sz } else { sz };
+                acc += v * wx * wy * wz;
+            }
+        }
+    }
+    acc
+}
+
+/// Fractal Brownian Motion — layered noise.
+fn fbm(p: Vec3, octaves: u32) -> f32 {
+    let mut val = 0.0;
+    let mut amp = 0.5;
+    let mut freq = 1.0;
+    let mut pos = p;
+    for _ in 0..octaves {
+        val += amp * vnoise(pos * freq);
+        freq *= 2.0;
+        amp *= 0.5;
+        pos = Vec3::new(pos.z * 1.1, pos.x * 0.9, pos.y * 1.05);
+    }
+    val
 }
 
 // ===== Main Menu =====

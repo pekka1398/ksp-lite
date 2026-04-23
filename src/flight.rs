@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
-use crate::{AppState, CelestialBody, Rocket, OrbitCamera, StageMarker, ExhaustFlame, FuelTank, Engine, FloatingOrigin, OrbitAngle, OrbitParent, SasMode};
+use crate::{AppState, CelestialBody, Rocket, OrbitCamera, StageMarker, ExhaustFlame, FuelTank, Engine, FloatingOrigin, OrbitAngle, OrbitParent, OrbitInclination, SasMode};
 use crate::DebugLaunched;
 use crate::vab::RocketConfig;
 use crate::constants::*;
@@ -594,21 +594,28 @@ pub fn time_warp_system(
 
 pub fn celestial_orbit_system(
     time: Res<Time<Virtual>>,
-    mut orbit_q: Query<(&mut OrbitAngle, &OrbitParent, &CelestialBody, &mut Transform)>,
+    mut orbit_q: Query<(&mut OrbitAngle, &OrbitParent, &CelestialBody, &mut Transform, Option<&OrbitInclination>)>,
     parent_q: Query<&Transform, (With<CelestialBody>, Without<OrbitAngle>)>,
 ) {
     let dt = time.delta_secs();
-    for (mut angle, parent, body, mut transform) in orbit_q.iter_mut() {
+    for (mut angle, parent, body, mut transform, inclination) in orbit_q.iter_mut() {
         if body.orbit_radius > 0.0 && body.orbit_speed > 0.0 {
             angle.0 += body.orbit_speed * dt;
             let parent_pos = parent_q.get(parent.0)
                 .map(|t| t.translation)
                 .unwrap_or(Vec3::ZERO);
-            transform.translation = parent_pos + Vec3::new(
+            let plane_pos = Vec3::new(
                 body.orbit_radius * angle.0.cos(),
                 0.0,
                 body.orbit_radius * angle.0.sin(),
             );
+            let inc = inclination.map(|i| i.0).unwrap_or(0.0);
+            let rotated = if inc != 0.0 {
+                Quat::from_rotation_x(inc) * plane_pos
+            } else {
+                plane_pos
+            };
+            transform.translation = parent_pos + rotated;
         }
     }
 }

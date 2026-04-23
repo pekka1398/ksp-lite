@@ -11,6 +11,13 @@ pub const MUN_RADIUS: f32 = 200.0;
 pub const MUN_SURFACE_GRAVITY: f32 = 1.0;
 pub const MUN_SOI_RADIUS: f32 = 2500.0;
 
+pub const MINMUS_ORBIT_RADIUS: f32 = 30000.0;
+pub const MINMUS_RADIUS: f32 = 60.0;
+pub const MINMUS_SURFACE_GRAVITY: f32 = 0.12;
+pub const MINMUS_SOI_RADIUS: f32 = 1500.0;
+/// Orbital inclination in degrees.
+pub const MINMUS_INCLINATION_DEG: f32 = 6.0;
+
 // ===== Sun =====
 
 pub const SUN_ORBIT_RADIUS: f32 = 50000.0;

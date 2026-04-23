@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
-use crate::{AppState, CelestialBody, Rocket};
+use crate::{AppState, CelestialBody, Rocket, OrbitInclination};
 use crate::constants::*;
 
 // ===== Resources =====
@@ -291,7 +291,7 @@ fn screen_marker_radius(cam_pos: Vec3, marker_pos: Vec3) -> f32 {
 
 pub fn orbit_prediction_system(
     mut gizmos: Gizmos,
-    planet_q: Query<(&CelestialBody, &Transform)>,
+    planet_q: Query<(&CelestialBody, &Transform, Option<&OrbitInclination>)>,
     rocket_q: Query<(&Transform, &Velocity, &ColliderMassProperties, Entity), With<Rocket>>,
     part_q: Query<(Entity, &Transform, &ColliderMassProperties, &Velocity), Without<Rocket>>,
     joint_q: Query<&ImpulseJoint>,
@@ -334,7 +334,7 @@ pub fn orbit_prediction_system(
     let com_pos = weighted_pos / total_mass;
     let com_vel = weighted_vel / total_mass;
 
-    let (planet, planet_tf) = find_soi_body(com_pos, planet_q.iter(), should_log);
+    let (planet, planet_tf) = find_soi_body(com_pos, planet_q.iter().map(|(b, t, _)| (b, t)), should_log);
 
     let pos = com_pos - planet_tf.translation;
     let vel = com_vel - soi_body_velocity(planet, planet_tf);
@@ -366,25 +366,30 @@ pub fn orbit_prediction_system(
     }
 
     // Draw orbital paths for celestial bodies that orbit another body
-    for (body, _) in planet_q.iter() {
+    for (body, _, inclination) in planet_q.iter() {
         if body.orbit_radius > 0.0 {
             // Find parent position — the body this one orbits
-            // For now, assume parent is at the position of the closest body with orbit_radius == 0
             let parent_pos = planet_q.iter()
-                .find(|(b, _)| b.orbit_radius == 0.0 && b.name != body.name)
-                .map(|(_, tf)| tf.translation)
+                .find(|(b, _, _)| b.orbit_radius == 0.0 && b.name != body.name)
+                .map(|(_, tf, _)| tf.translation)
                 .unwrap_or(Vec3::ZERO);
 
+            let inc = inclination.map(|i| i.0).unwrap_or(0.0);
             let segments = 128;
             let mut points = Vec::with_capacity(segments + 1);
             for i in 0..=segments {
                 let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
-                let p = parent_pos + Vec3::new(
+                let plane_pos = Vec3::new(
                     body.orbit_radius * angle.cos(),
                     0.0,
                     body.orbit_radius * angle.sin(),
                 );
-                points.push(p);
+                let rotated = if inc != 0.0 {
+                    Quat::from_rotation_x(inc) * plane_pos
+                } else {
+                    plane_pos
+                };
+                points.push(parent_pos + rotated);
             }
             gizmos.linestrip(points, Color::srgba(0.4, 0.4, 0.4, 0.5));
         }
