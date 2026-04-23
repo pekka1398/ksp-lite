@@ -7,7 +7,6 @@ use bevy_rapier3d::prelude::*;
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, States)]
 enum AppState {
     #[default]
-    VAB,
     Flight,
     MapView,
     Paused,
@@ -27,7 +26,7 @@ struct TimeWarp {
 impl Default for TimeWarp {
     fn default() -> Self {
         Self {
-            rates: vec![1.0, 2.0, 5.0, 10.0, 50.0, 100.0],
+            rates: vec![1.0, 2.0, 5.0, 10.0, 20.0],
             index: 0,
         }
     }
@@ -42,17 +41,28 @@ impl TimeWarp {
 /// A maneuver node: planned delta-v burn at a future point on the orbit.
 /// Components are in orbital frame: prograde (along velocity),
 /// normal (along angular momentum), radial (in-plane toward body).
-#[derive(Resource, Default)]
+#[derive(Resource)]
 struct ManeuverNode {
     prograde: f32,
     normal: f32,
     radial: f32,
-    time_offset: f32, // seconds into the future where the node is placed
+    ut: f64, // absolute game-time (seconds) when the burn happens; < 0 = no node
+}
+
+impl Default for ManeuverNode {
+    fn default() -> Self {
+        Self {
+            prograde: 0.0,
+            normal: 0.0,
+            radial: 0.0,
+            ut: -1.0,
+        }
+    }
 }
 
 impl ManeuverNode {
     fn is_active(&self) -> bool {
-        self.prograde.abs() > 0.01 || self.normal.abs() > 0.01 || self.radial.abs() > 0.01
+        self.ut >= 0.0
     }
 }
 
@@ -182,6 +192,15 @@ fn find_soi_body<'a>(
     }
 
     soi.or(nearest).unwrap()
+}
+
+/// Compute the world-space velocity of a celestial body.
+fn soi_body_velocity(body: &CelestialBody, body_tf: &Transform) -> Vec3 {
+    if body.orbit_radius > 0.0 && body.orbit_speed > 0.0 {
+        body.orbit_speed * Vec3::new(-body_tf.translation.z, 0.0, body_tf.translation.x)
+    } else {
+        Vec3::ZERO
+    }
 }
 
 #[derive(Component)]
@@ -501,15 +520,12 @@ fn rocket_flight_system(
     let torque_amount = 8000.0;
     let mut manual_input = false;
 
-    // Disallow manual rotation during time warp, but keep SAS active
-    if warp_rate <= 1.0 {
-        if keys.pressed(KeyCode::KeyW) { target_torque.x += torque_amount; manual_input = true; }
-        if keys.pressed(KeyCode::KeyS) { target_torque.x -= torque_amount; manual_input = true; }
-        if keys.pressed(KeyCode::KeyA) { target_torque.z += torque_amount; manual_input = true; }
-        if keys.pressed(KeyCode::KeyD) { target_torque.z -= torque_amount; manual_input = true; }
-        if keys.pressed(KeyCode::KeyQ) { target_torque.y += torque_amount; manual_input = true; }
-        if keys.pressed(KeyCode::KeyE) { target_torque.y -= torque_amount; manual_input = true; }
-    }
+    if keys.pressed(KeyCode::KeyW) { target_torque.x += torque_amount; manual_input = true; }
+    if keys.pressed(KeyCode::KeyS) { target_torque.x -= torque_amount; manual_input = true; }
+    if keys.pressed(KeyCode::KeyA) { target_torque.z += torque_amount; manual_input = true; }
+    if keys.pressed(KeyCode::KeyD) { target_torque.z -= torque_amount; manual_input = true; }
+    if keys.pressed(KeyCode::KeyQ) { target_torque.y += torque_amount; manual_input = true; }
+    if keys.pressed(KeyCode::KeyE) { target_torque.y -= torque_amount; manual_input = true; }
 
     let world_torque = if manual_input {
         rocket_tf.rotation * target_torque
@@ -616,6 +632,7 @@ fn telemetry_system(
     part_q: Query<(&FuelTank, &Engine)>,
     mut text_q: Query<&mut Text, With<TelemetryUI>>,
     time_warp: Res<TimeWarp>,
+    time: Res<Time<Virtual>>,
     maneuver: Res<ManeuverNode>,
 ) {
     let Ok((rocket, transform, velocity)) = rocket_q.get_single() else { return; };
@@ -654,6 +671,27 @@ fn telemetry_system(
         0.0
     };
 
+    // Compute Ap/Pe altitudes from orbital elements
+    let rel_pos = transform.translation - planet_center;
+    let rel_vel = velocity.linvel;
+    let ap_pe_str = {
+        let h = rel_pos.cross(rel_vel);
+        let h_mag = h.length();
+        let e_vec = if h_mag > 0.001 { (rel_vel.cross(h) / planet.mu) - rel_pos.normalize() } else { Vec3::ZERO };
+        let e = e_vec.length();
+        let energy = rel_vel.length_squared() / 2.0 - planet.mu / rel_pos.length();
+        let a = if e < 1.0 && energy.abs() > 0.001 { -planet.mu / (2.0 * energy) } else { 0.0 };
+        if e > 0.001 && e < 1.0 && a > 0.0 {
+            let r_ap = a * (1.0 + e);
+            let r_pe = a * (1.0 - e);
+            let ap_alt = r_ap - planet.radius;
+            let pe_alt = r_pe - planet.radius;
+            format!("\nAp: {:.0} m\nPe: {:.0} m", ap_alt, pe_alt)
+        } else {
+            "".to_string()
+        }
+    };
+
     let warp_str = if time_warp.rate() > 1.0 {
         format!(" (Warp x{:.0})", time_warp.rate())
     } else {
@@ -662,8 +700,9 @@ fn telemetry_system(
 
     let maneuver_str = if maneuver.is_active() {
         let dv = f32::sqrt(maneuver.prograde * maneuver.prograde + maneuver.normal * maneuver.normal + maneuver.radial * maneuver.radial);
-        let t_min = maneuver.time_offset / 60.0;
-        let t_sec = maneuver.time_offset % 60.0;
+        let time_to_node = (maneuver.ut - time.elapsed_secs_f64()).max(0.0);
+        let t_min = (time_to_node / 60.0).floor();
+        let t_sec = time_to_node % 60.0;
         format!(
             "\n--- Maneuver ---\nT-: {:.0}m {:.0}s\ndV: {:.0} m/s\n  Prograde: {:.0}\n  Normal: {:.0}\n  Radial: {:.0}",
             t_min, t_sec, dv, maneuver.prograde, maneuver.normal, maneuver.radial,
@@ -673,7 +712,7 @@ fn telemetry_system(
     };
 
     text.0 = format!(
-        "SOI: {}\nStage: {}\nAltitude: {:.1} m\nPitch (vs Horizon): {:.1} deg\nOrbital Vel: {:.1} m/s\nSurface Vel: {:.1} m/s\nV.Speed: {:.1} m/s\nThrottle: {:.0}%{}\nThrust: {:.0} N\nFuel: {:.0} kg\nAir Density: {:.3}{}",
+        "SOI: {}\nStage: {}\nAltitude: {:.1} m\nPitch (vs Horizon): {:.1} deg\nOrbital Vel: {:.1} m/s\nSurface Vel: {:.1} m/s\nV.Speed: {:.1} m/s\nThrottle: {:.0}%{}\nThrust: {:.0} N\nFuel: {:.0} kg\nAir Density: {:.3}{}{}",
         planet.name,
         rocket.current_stage,
         altitude,
@@ -686,6 +725,7 @@ fn telemetry_system(
         current_thrust,
         current_fuel,
         density,
+        ap_pe_str,
         maneuver_str,
     );
 }
@@ -694,7 +734,22 @@ fn time_warp_system(
     keys: Res<ButtonInput<KeyCode>>,
     mut time_warp: ResMut<TimeWarp>,
     mut time: ResMut<Time<Virtual>>,
+    rocket_q: Query<&Transform, With<Rocket>>,
+    planet_q: Query<(&CelestialBody, &Transform), Without<Rocket>>,
 ) {
+    // Safety: prevent warp if in atmosphere
+    if let Ok(rocket_tf) = rocket_q.get_single() {
+        let (body, body_tf) = find_soi_body(rocket_tf.translation, planet_q.iter());
+        let altitude = (rocket_tf.translation - body_tf.translation).length() - body.radius;
+        if altitude < body.atmosphere_height && body.atmosphere_height > 0.0 {
+            if time_warp.index > 0 {
+                time_warp.index = 0;
+                time.set_relative_speed(1.0);
+            }
+            return; // Can't warp in atmosphere, skip key handling too
+        }
+    }
+
     let mut changed = false;
     if keys.just_pressed(KeyCode::Period) {
         if time_warp.index < time_warp.rates.len() - 1 {
@@ -709,9 +764,7 @@ fn time_warp_system(
         }
     }
     if changed {
-        let rate = time_warp.rate();
-        // Scale game-logic dt (fuel burn, torque, etc.) via Time<Virtual>
-        time.set_relative_speed(rate);
+        time.set_relative_speed(time_warp.rate());
     }
 }
 
@@ -735,18 +788,25 @@ fn celestial_orbit_system(
 /// Maneuver node management: create, adjust, delete nodes.
 /// N = create/toggle node, Delete/Backspace = remove node
 /// I/K = adjust prograde +/-, J/L = adjust radial +/-, U/O = adjust normal +/-
-/// T/G = adjust time offset +/- (move node earlier/later on orbit)
+/// T/G = adjust UT +/- (move node earlier/later on orbit)
 fn maneuver_node_system(
     keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time<Virtual>>,
     mut node: ResMut<ManeuverNode>,
 ) {
+    let now = time.elapsed_secs_f64();
+
     // Toggle/create node
     if keys.just_pressed(KeyCode::KeyN) {
         if node.is_active() {
             *node = ManeuverNode::default();
         } else {
-            node.prograde = 100.0;
-            node.time_offset = 300.0; // Default 5 minutes ahead
+            *node = ManeuverNode {
+                prograde: 100.0,
+                normal: 0.0,
+                radial: 0.0,
+                ut: now + 300.0, // Default 5 minutes ahead
+            };
         }
     }
 
@@ -755,26 +815,35 @@ fn maneuver_node_system(
         *node = ManeuverNode::default();
     }
 
-    // Adjust prograde (I = increase, K = decrease)
-    let dv_step = 50.0;
-    if keys.just_pressed(KeyCode::KeyI) { node.prograde += dv_step; }
-    if keys.just_pressed(KeyCode::KeyK) { node.prograde -= dv_step; }
+    // Adjust dV and UT only when a node exists
+    if node.is_active() {
+        // Adjust prograde (I = increase, K = decrease)
+        let dv_step = 50.0;
+        if keys.just_pressed(KeyCode::KeyI) { node.prograde += dv_step; }
+        if keys.just_pressed(KeyCode::KeyK) { node.prograde -= dv_step; }
 
-    // Adjust radial (J = inward, L = outward)
-    if keys.just_pressed(KeyCode::KeyJ) { node.radial -= dv_step; }
-    if keys.just_pressed(KeyCode::KeyL) { node.radial += dv_step; }
+        // Adjust radial (J = inward, L = outward)
+        if keys.just_pressed(KeyCode::KeyJ) { node.radial -= dv_step; }
+        if keys.just_pressed(KeyCode::KeyL) { node.radial += dv_step; }
 
-    // Adjust normal (U = -, O = +)
-    if keys.just_pressed(KeyCode::KeyU) { node.normal -= dv_step; }
-    if keys.just_pressed(KeyCode::KeyO) { node.normal += dv_step; }
+        // Adjust normal (U = -, O = +)
+        if keys.just_pressed(KeyCode::KeyU) { node.normal -= dv_step; }
+        if keys.just_pressed(KeyCode::KeyO) { node.normal += dv_step; }
 
-    // Adjust time offset (T = later, G = earlier) by 30 seconds
-    let time_step = 30.0;
-    if keys.just_pressed(KeyCode::KeyT) { node.time_offset += time_step; }
-    if keys.just_pressed(KeyCode::KeyG) { node.time_offset = (node.time_offset - time_step).max(0.0); }
+        // Adjust UT (T = later, G = earlier) by 30 seconds
+        let time_step = 30.0_f64;
+        if keys.just_pressed(KeyCode::KeyT) { node.ut += time_step; }
+        if keys.just_pressed(KeyCode::KeyG) { node.ut = (node.ut - time_step).max(now); }
+    }
 }
 
 
+
+/// Ap/Pe world positions returned by draw_orbit_gizmo.
+struct ApPe {
+    apoapsis: Option<Vec3>,
+    periapsis: Option<Vec3>,
+}
 
 /// Draw a Keplerian orbit from position/velocity around a body at planet_center.
 fn draw_orbit_gizmo(
@@ -785,14 +854,14 @@ fn draw_orbit_gizmo(
     planet_center: Vec3,
     planet_radius: f32,
     color: Color,
-) {
+) -> ApPe {
     let altitude = pos.length() - planet_radius;
     let speed = vel.length();
-    if altitude < 10.0 || speed < 10.0 { return; }
+    if altitude < 10.0 || speed < 10.0 { return ApPe { apoapsis: None, periapsis: None }; }
 
     let h = pos.cross(vel);
     let h_mag = h.length();
-    if h_mag < 0.001 { return; }
+    if h_mag < 0.001 { return ApPe { apoapsis: None, periapsis: None }; }
 
     let e_vec = (vel.cross(h) / mu) - pos.normalize();
     let e = e_vec.length();
@@ -808,6 +877,18 @@ fn draw_orbit_gizmo(
 
     let p = e_vec.normalize_or(Vec3::X);
     let q = h.cross(p).normalize();
+
+    // Compute Ap/Pe positions along the eccentricity vector direction
+    let ap_pe = if e < 1.0 && e > 0.001 {
+        let r_ap = a * (1.0 + e);
+        let r_pe = a * (1.0 - e);
+        ApPe {
+            apoapsis: Some(planet_center + p * r_ap),
+            periapsis: Some(planet_center - p * r_pe),
+        }
+    } else {
+        ApPe { apoapsis: None, periapsis: None }
+    };
 
     let num_segments = 128;
 
@@ -838,6 +919,8 @@ fn draw_orbit_gizmo(
             gizmos.linestrip(points, color);
         }
     }
+
+    ap_pe
 }
 
 fn orbit_prediction_system(
@@ -847,9 +930,12 @@ fn orbit_prediction_system(
     part_q: Query<(Entity, &Transform, &ColliderMassProperties, &Velocity), Without<Rocket>>,
     joint_q: Query<&ImpulseJoint>,
     state: Res<State<AppState>>,
-    maneuver: Res<ManeuverNode>,
+    time: Res<Time<Virtual>>,
+    mut maneuver: ResMut<ManeuverNode>,
 ) {
     if *state.get() != AppState::MapView { return; }
+
+    let now = time.elapsed_secs_f64();
 
     let Ok((rocket_tf, rocket_vel, rocket_mass_props, rocket_entity)) = rocket_q.get_single() else { return; };
 
@@ -880,24 +966,41 @@ fn orbit_prediction_system(
     let (planet, planet_tf) = find_soi_body(com_pos, planet_q.iter());
 
     let pos = com_pos - planet_tf.translation;
-    let vel = com_vel;
+    let vel = com_vel - soi_body_velocity(planet, planet_tf);
     let mu = planet.mu;
 
-    // Draw current orbit (cyan)
-    draw_orbit_gizmo(&mut gizmos, pos, vel, mu, planet_tf.translation, planet.radius, Color::srgb(0.0, 0.8, 1.0));
+    // Draw current orbit (cyan) and get Ap/Pe
+    let ap_pe = draw_orbit_gizmo(&mut gizmos, pos, vel, mu, planet_tf.translation, planet.radius, Color::srgb(0.0, 0.8, 1.0));
 
-    // Draw maneuver orbit (yellow) if node exists
-    if maneuver.is_active() && maneuver.time_offset >= 0.0 {
+    // Ship marker (green diamond)
+    gizmos.sphere(com_pos, 10.0, Color::srgb(0.0, 1.0, 0.0));
+
+    // Ap/Pe markers on current orbit
+    let marker_size = 12.0;
+    if let Some(ap_pos) = ap_pe.apoapsis {
+        gizmos.sphere(ap_pos, marker_size, Color::srgb(1.0, 0.3, 0.3));
+    }
+    if let Some(pe_pos) = ap_pe.periapsis {
+        gizmos.sphere(pe_pos, marker_size, Color::srgb(0.3, 0.6, 1.0));
+    }
+
+    // Draw maneuver orbit (yellow) if node exists and is in the future
+    let time_to_node = (maneuver.ut - now) as f32;
+    if maneuver.is_active() && time_to_node <= 0.0 {
+        // Node is in the past — auto-remove
+        *maneuver = ManeuverNode::default();
+    }
+    if maneuver.is_active() {
         let speed = vel.length();
         if speed > 0.1 {
             // Propagate current orbit to the maneuver time
-            let (future_pos, future_vel) = propagate_kepler(pos, vel, mu, maneuver.time_offset);
+            let (future_pos, future_vel) = propagate_kepler(pos, vel, mu, time_to_node);
 
             // Draw the trajectory segment from current position to the node (gray)
             let mut trail_points = vec![planet_tf.translation + pos];
             let trail_steps = 50;
             for i in 1..=trail_steps {
-                let t = maneuver.time_offset * (i as f32 / trail_steps as f32);
+                let t = time_to_node * (i as f32 / trail_steps as f32);
                 let (rp, _) = propagate_kepler(pos, vel, mu, t);
                 trail_points.push(planet_tf.translation + rp);
             }
@@ -918,7 +1021,7 @@ fn orbit_prediction_system(
                         + radial_dir * maneuver.radial;
 
                     let post_maneuver_vel = future_vel + maneuver_dv;
-                    draw_orbit_gizmo(
+                    let mnv_ap_pe = draw_orbit_gizmo(
                         &mut gizmos,
                         future_pos,
                         post_maneuver_vel,
@@ -928,9 +1031,17 @@ fn orbit_prediction_system(
                         Color::srgb(1.0, 0.9, 0.0),
                     );
 
-                    // Draw maneuver node marker at future position
+                    // Maneuver node marker (orange)
                     let node_world = planet_tf.translation + future_pos;
-                    gizmos.sphere(node_world, 8.0, Color::srgb(1.0, 0.3, 0.0));
+                    gizmos.sphere(node_world, 12.0, Color::srgb(1.0, 0.3, 0.0));
+
+                    // Ap/Pe on maneuver orbit
+                    if let Some(ap_pos) = mnv_ap_pe.apoapsis {
+                        gizmos.sphere(ap_pos, marker_size, Color::srgb(1.0, 0.5, 0.3));
+                    }
+                    if let Some(pe_pos) = mnv_ap_pe.periapsis {
+                        gizmos.sphere(pe_pos, marker_size, Color::srgb(0.3, 0.5, 1.0));
+                    }
                 }
             }
         }
@@ -944,7 +1055,7 @@ fn map_view_toggle_system(
 ) {
     if keys.just_pressed(KeyCode::KeyM) {
         match state.get() {
-            AppState::Flight | AppState::VAB => next_state.set(AppState::MapView),
+            AppState::Flight => next_state.set(AppState::MapView),
             AppState::MapView => next_state.set(AppState::Flight),
             _ => {}
         }
@@ -998,7 +1109,7 @@ fn pause_menu_system(
 }
 
 fn camera_controller(
-    time: Res<Time<Virtual>>,
+    real_time: Res<Time<Real>>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     state: Res<State<AppState>>,
@@ -1008,7 +1119,7 @@ fn camera_controller(
     rocket_query: Query<&Transform, (With<Rocket>, Without<OrbitCamera>)>,
     planet_query: Query<(&CelestialBody, &Transform), (With<CelestialBody>, Without<OrbitCamera>)>,
 ) {
-    let dt = time.delta_secs();
+    let dt = real_time.delta_secs();
 
     // Focus target depends on state
     let target_pos = if *state.get() == AppState::MapView {
