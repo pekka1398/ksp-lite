@@ -1,7 +1,8 @@
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
-use crate::{AppState, CelestialBody, Rocket, OrbitCamera, StageMarker, ExhaustFlame, FuelTank, Engine};
+use crate::{AppState, CelestialBody, Rocket, OrbitCamera, StageMarker, ExhaustFlame, FuelTank, Engine, FloatingOrigin, OrbitAngle, OrbitParent, SasMode};
+use crate::DebugLaunched;
 use crate::vab::RocketConfig;
 use crate::constants::*;
 
@@ -99,11 +100,15 @@ pub fn spawn_flight(
         ));
 
         if is_top {
-            entity_cmds.insert(Rocket {
-                throttle: 0.0,
-                is_launched: false,
-                current_stage: n_stages - 1,
-            });
+            entity_cmds.insert((
+                Rocket {
+                    throttle: 0.0,
+                    is_launched: false,
+                    current_stage: n_stages - 1,
+                    sas_mode: SasMode::default(),
+                },
+                FloatingOrigin,
+            ));
             entity_cmds.with_child((
                 Mesh3d(meshes.add(Cone { radius: stage.radius, height: stage.radius * NOSE_CONE_HEIGHT_FACTOR })),
                 MeshMaterial3d(mat_nose.clone()),
@@ -205,7 +210,18 @@ pub fn cleanup_game(
     mut time_warp: ResMut<crate::TimeWarp>,
     mut time: ResMut<Time<Virtual>>,
     mut maneuver: ResMut<crate::orbit::ManeuverNode>,
+    mut offset: ResMut<crate::FloatingOriginOffset>,
+    mut transform_q: Query<&mut Transform>,
 ) {
+    // Reset floating origin: shift everything back to true world coordinates
+    if offset.0.length() > 0.0 {
+        let shift = offset.0;
+        for mut tf in transform_q.iter_mut() {
+            tf.translation += shift;
+        }
+        offset.0 = Vec3::ZERO;
+    }
+
     for entity in game_entities.iter() {
         commands.entity(entity).despawn_recursive();
     }
@@ -279,6 +295,15 @@ pub fn rocket_flight_system(
     if keys.just_pressed(KeyCode::KeyX) { rocket.throttle = 0.0; }
     rocket.throttle = rocket.throttle.clamp(0.0, 1.0);
 
+    // SAS mode toggle
+    if keys.just_pressed(KeyCode::KeyT) {
+        rocket.sas_mode = match rocket.sas_mode {
+            SasMode::Stability => SasMode::Prograde,
+            SasMode::Prograde => SasMode::Retrograde,
+            SasMode::Retrograde => SasMode::Stability,
+        };
+    }
+
     let mut target_torque = Vec3::ZERO;
     let mut manual_input = false;
 
@@ -289,25 +314,69 @@ pub fn rocket_flight_system(
     if keys.pressed(KeyCode::KeyQ) { target_torque.y += ROCKET_TORQUE; manual_input = true; }
     if keys.pressed(KeyCode::KeyE) { target_torque.y -= ROCKET_TORQUE; manual_input = true; }
 
+    // Compute orbital velocity for SAS alignment
+    let (soi_body, soi_tf) = crate::orbit::find_soi_body(rocket_tf.translation, planet_q.iter(), false);
+
     let world_torque = if manual_input {
         rocket_tf.rotation * target_torque
     } else {
-        -rocket_vel.angvel * SAS_DAMPING
+        match rocket.sas_mode {
+            SasMode::Stability => -rocket_vel.angvel * SAS_DAMPING,
+            SasMode::Prograde | SasMode::Retrograde => {
+                let rel_pos = rocket_tf.translation - soi_tf.translation;
+                let soi_vel = crate::orbit::soi_body_velocity(soi_body, soi_tf);
+                let orbital_vel = rocket_vel.linvel
+                    + crate::orbit::surface_rotation_velocity(soi_body, rel_pos)
+                    - soi_vel;
+                let speed = orbital_vel.length();
+                if speed < 1.0 {
+                    -rocket_vel.angvel * SAS_DAMPING
+                } else {
+                    let desired_forward = if rocket.sas_mode == SasMode::Prograde {
+                        orbital_vel.normalize()
+                    } else {
+                        -orbital_vel.normalize()
+                    };
+                    // Align rocket's up() to desired_forward
+                    let current_up = rocket_tf.up();
+                    let cross = current_up.cross(desired_forward);
+                    let dot = current_up.dot(desired_forward);
+                    let correction = cross * SAS_DAMPING * 2.0
+                        + (-rocket_vel.angvel) * SAS_DAMPING;
+                    if dot < -0.9 {
+                        // Nearly opposite — use a kick to break symmetry
+                        correction + rocket_tf.right() * ROCKET_TORQUE * 0.3
+                    } else {
+                        correction
+                    }
+                }
+            }
+        }
     };
 
     rocket_ext_force.torque = world_torque;
 
-    let (soi_body, soi_tf) = crate::orbit::find_soi_body(rocket_tf.translation, planet_q.iter(), false);
+    // N-body gravity: collect all planet positions so the closure can iterate them
+    let planet_gravity: Vec<(f32, Vec3)> = planet_q.iter()
+        .map(|(b, tf)| (b.mu, tf.translation))
+        .collect();
 
     let compute_gravity_and_drag = |pos: Vec3, mass: f32, vel: &Velocity| -> Vec3 {
         let mut force = Vec3::ZERO;
-        let to_body = soi_tf.translation - pos;
-        let dist = to_body.length();
-        let dist_sq = dist * dist;
-        if dist_sq > MIN_DIST_SQ_FOR_GRAVITY {
-            force += to_body.normalize() * (soi_body.mu * mass / dist_sq);
+        // Gravity from all celestial bodies (not just SOI)
+        for (mu, body_pos) in &planet_gravity {
+            if *mu == 0.0 { continue; }
+            let to_body = *body_pos - pos;
+            let dist_sq = to_body.length_squared();
+            if dist_sq > MIN_DIST_SQ_FOR_GRAVITY {
+                let dist = dist_sq.sqrt();
+                force += to_body * (*mu * mass / (dist_sq * dist));
+            }
         }
-        let altitude = dist - soi_body.radius;
+        // Atmospheric drag from SOI body only
+        let to_soi = soi_tf.translation - pos;
+        let soi_dist = to_soi.length();
+        let altitude = soi_dist - soi_body.radius;
         if altitude < soi_body.atmosphere_height && soi_body.atmosphere_height > 0.0 {
             let scale_height = soi_body.atmosphere_height / ATMOSPHERE_SCALE_HEIGHT_DIVISOR;
             let density = (-altitude / scale_height).exp();
@@ -404,7 +473,8 @@ pub fn telemetry_system(
     let altitude = dist - planet.radius;
 
     let rel_pos = transform.translation - planet_center;
-    let inertial_vel = velocity.linvel + crate::orbit::surface_rotation_velocity(planet, rel_pos);
+    let soi_vel = crate::orbit::soi_body_velocity(planet, p_transform);
+    let inertial_vel = velocity.linvel + crate::orbit::surface_rotation_velocity(planet, rel_pos) - soi_vel;
     let orbital_vel_mag = inertial_vel.length();
 
     let pitch_deg = transform.up().dot(local_up).asin().to_degrees();
@@ -455,8 +525,14 @@ pub fn telemetry_system(
         "".to_string()
     };
 
+    let sas_str = match rocket.sas_mode {
+        SasMode::Stability => "SAS: Stability".to_string(),
+        SasMode::Prograde => "SAS: Prograde".to_string(),
+        SasMode::Retrograde => "SAS: Retrograde".to_string(),
+    };
+
     text.0 = format!(
-        "SOI: {}\nStage: {}\nAltitude: {:.1} m\nPitch (vs Horizon): {:.1} deg\nOrbital Vel: {:.1} m/s\nSurface Vel: {:.1} m/s\nV.Speed: {:.1} m/s\nThrottle: {:.0}%{}\nThrust: {:.0} N\nFuel: {:.0} kg\nAir Density: {:.3}{}{}",
+        "SOI: {}\nStage: {}\nAltitude: {:.1} m\nPitch (vs Horizon): {:.1} deg\nOrbital Vel: {:.1} m/s\nSurface Vel: {:.1} m/s\nV.Speed: {:.1} m/s\nThrottle: {:.0}%{}\nThrust: {:.0} N\nFuel: {:.0} kg\nAir Density: {:.3}{}\n{}{}",
         planet.name,
         rocket.current_stage,
         altitude,
@@ -469,6 +545,7 @@ pub fn telemetry_system(
         current_thrust,
         current_fuel,
         density,
+        sas_str,
         ap_pe_str,
         maneuver_str,
     );
@@ -513,14 +590,21 @@ pub fn time_warp_system(
 
 pub fn celestial_orbit_system(
     time: Res<Time<Virtual>>,
-    mut query: Query<(&CelestialBody, &mut Transform)>,
+    mut orbit_q: Query<(&mut OrbitAngle, &OrbitParent, &CelestialBody, &mut Transform)>,
+    parent_q: Query<&Transform, (With<CelestialBody>, Without<OrbitAngle>)>,
 ) {
     let dt = time.delta_secs();
-    for (body, mut transform) in query.iter_mut() {
+    for (mut angle, parent, body, mut transform) in orbit_q.iter_mut() {
         if body.orbit_radius > 0.0 && body.orbit_speed > 0.0 {
-            let angle = body.orbit_speed * dt;
-            let rotation = Quat::from_rotation_y(angle);
-            transform.translation = rotation * transform.translation;
+            angle.0 += body.orbit_speed * dt;
+            let parent_pos = parent_q.get(parent.0)
+                .map(|t| t.translation)
+                .unwrap_or(Vec3::ZERO);
+            transform.translation = parent_pos + Vec3::new(
+                body.orbit_radius * angle.0.cos(),
+                0.0,
+                body.orbit_radius * angle.0.sin(),
+            );
         }
     }
 }
@@ -581,4 +665,69 @@ pub fn map_view_toggle_system(
             _ => {}
         }
     }
+}
+
+// ===== Debug Orbit Spawn =====
+
+pub fn debug_orbit_apply_system(
+    mut commands: Commands,
+    launched: Option<ResMut<DebugLaunched>>,
+    planet_q: Query<(&CelestialBody, &Transform), Without<FlightEntity>>,
+    mut transforms: ParamSet<(
+        Query<&Transform, (With<Rocket>, With<FlightEntity>)>,
+        Query<&mut Transform, With<FlightEntity>>,
+    )>,
+    mut rocket_mut: Query<&mut Rocket>,
+    mut vel_q: Query<&mut Velocity, With<FlightEntity>>,
+) {
+    if launched.is_none() { return; }
+
+    let rocket_pos = match transforms.p0().get_single() {
+        Ok(tf) => tf.translation,
+        Err(_) => return,
+    };
+
+    let (mun_body, mun_tf) = match planet_q.iter().find(|(b, _)| b.name == "Mun") {
+        Some(pair) => pair,
+        None => return,
+    };
+
+    // Circular orbit around Mun at DEBUG_ORBIT_ALTITUDE above surface
+    // mu_mun = g × r² = 1.0 × 200² = 40,000
+    // orbit_r = MUN_RADIUS + altitude = 300
+    // v_circular = sqrt(40,000 / 300) ≈ 11.55 m/s
+    let orbit_r = mun_body.radius + DEBUG_ORBIT_ALTITUDE;
+    let v_circular = (mun_body.mu / orbit_r).sqrt();
+
+    // Mun's orbital velocity in world frame
+    // At t=0 Mun is at (14000,0,0), angular_speed ≈ 0.0027 rad/s
+    // Mun velocity = (0, 0, ~37.8) m/s
+    let mun_vel = crate::orbit::soi_body_velocity(mun_body, mun_tf);
+
+    // Place rocket on the Mun-far-from-Kerbin side, radial outward
+    // At t=0: mun_dir = (1,0,0), orbit_pos = (14300, 0, 0)
+    let mun_dir = mun_tf.translation.normalize_or(Vec3::X);
+    let orbit_pos = mun_tf.translation + mun_dir * orbit_r;
+
+    // Prograde: tangent to counterclockwise circular orbit
+    // For radial (cos θ, 0, sin θ), prograde = (-sin θ, 0, cos θ)
+    // At t=0: prograde = (0, 0, 1)
+    let prograde = Vec3::new(-mun_dir.z, 0.0, mun_dir.x);
+    let orbit_vel = mun_vel + prograde * v_circular;
+
+    let offset = orbit_pos - rocket_pos;
+
+    for mut tf in transforms.p1().iter_mut() {
+        tf.translation += offset;
+    }
+
+    for mut vel in vel_q.iter_mut() {
+        vel.linvel = orbit_vel;
+    }
+
+    for mut rocket in rocket_mut.iter_mut() {
+        rocket.is_launched = true;
+    }
+
+    commands.remove_resource::<DebugLaunched>();
 }

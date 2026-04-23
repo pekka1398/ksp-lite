@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bevy::ecs::system::ParamSet;
 use bevy::time::Real;
 use bevy::ecs::event::EventReader;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
@@ -33,8 +34,12 @@ struct MainMenuUI;
 #[derive(Component)]
 enum MenuButton {
     Start,
+    Orbit,
     Quit,
 }
+
+#[derive(Resource)]
+pub struct DebugLaunched;
 
 // ===== Shared Resources =====
 
@@ -85,6 +90,15 @@ pub struct Rocket {
     pub is_launched: bool,
     pub throttle: f32,
     pub current_stage: usize,
+    pub sas_mode: SasMode,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum SasMode {
+    #[default]
+    Stability,
+    Prograde,
+    Retrograde,
 }
 
 #[derive(Component)]
@@ -106,6 +120,35 @@ pub struct StageMarker(pub usize);
 #[derive(Component)]
 pub struct ExhaustFlame(pub usize);
 
+#[derive(Component)]
+pub struct FloatingOrigin;
+
+#[derive(Resource, Default)]
+pub struct FloatingOriginOffset(pub Vec3);
+
+#[derive(Resource)]
+pub struct FloatingOriginSettings {
+    pub threshold: f32,
+}
+
+impl Default for FloatingOriginSettings {
+    fn default() -> Self {
+        Self { threshold: constants::FLOATING_ORIGIN_THRESHOLD }
+    }
+}
+
+#[derive(Component)]
+pub struct OrbitAngle(pub f32);
+
+#[derive(Component)]
+pub struct OrbitParent(pub Entity);
+
+#[derive(Component)]
+struct SunLight;
+
+#[derive(Component)]
+struct SunMarker;
+
 // ===== Main =====
 
 fn main() {
@@ -123,15 +166,17 @@ fn main() {
         .init_resource::<ManeuverNode>()
         .init_resource::<PrePauseView>()
         .init_resource::<RocketConfig>()
+        .init_resource::<FloatingOriginOffset>()
+        .init_resource::<FloatingOriginSettings>()
         .add_systems(Startup, setup_scene)
-        // State transitions
+        // State transitions — cleanup before spawn so floating origin resets first
+        .add_systems(OnEnter(AppState::MainMenu), flight::cleanup_game)
         .add_systems(OnEnter(AppState::MainMenu), spawn_main_menu)
         .add_systems(OnExit(AppState::MainMenu), despawn_main_menu)
+        .add_systems(OnEnter(AppState::VAB), flight::cleanup_game)
         .add_systems(OnEnter(AppState::VAB), vab::spawn_vab)
         .add_systems(OnExit(AppState::VAB), vab::despawn_vab)
         .add_systems(OnEnter(AppState::Flight), flight::spawn_flight)
-        .add_systems(OnEnter(AppState::MainMenu), flight::cleanup_game)
-        .add_systems(OnEnter(AppState::VAB), flight::cleanup_game)
         // Update systems
         .add_systems(
             Update,
@@ -146,13 +191,21 @@ fn main() {
                 flight::time_warp_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
                 orbit::maneuver_node_system.run_if(in_state(AppState::MapView)),
                 flight::pause_menu_system,
+                flight::debug_orbit_apply_system,
             ),
         )
         .add_systems(
             PostUpdate,
-            camera_controller
-                .after(PhysicsSet::Writeback)
-                .before(TransformSystem::TransformPropagate),
+            (
+                floating_origin_system
+                    .before(PhysicsSet::SyncBackend),
+                sun_light_system
+                    .after(PhysicsSet::Writeback)
+                    .before(TransformSystem::TransformPropagate),
+                camera_controller
+                    .after(PhysicsSet::Writeback)
+                    .before(TransformSystem::TransformPropagate),
+            ),
         )
         .run();
 }
@@ -166,8 +219,8 @@ fn setup_scene(
 ) {
     let kerbin_mu = constants::KERBIN_SURFACE_GRAVITY * constants::KERBIN_RADIUS * constants::KERBIN_RADIUS;
 
-    commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(constants::KERBIN_RADIUS))),
+    let kerbin_entity = commands.spawn((
+        Mesh3d(meshes.add(Sphere::new(constants::KERBIN_RADIUS).mesh().ico(8).unwrap())),
         MeshMaterial3d(materials.add(Color::srgb(0.2, 0.6, 0.4))),
         Transform::from_xyz(0.0, 0.0, 0.0),
         Collider::ball(constants::KERBIN_RADIUS),
@@ -182,17 +235,17 @@ fn setup_scene(
             orbit_speed: 0.0,
             rotation_speed: constants::KERBIN_ROTATION_SPEED,
         },
-    ));
+    )).id();
 
     let mun_mu = constants::MUN_SURFACE_GRAVITY * constants::MUN_RADIUS * constants::MUN_RADIUS;
     let mun_orbital_speed = f32::sqrt(kerbin_mu / constants::MUN_ORBIT_RADIUS);
     let mun_angular_speed = mun_orbital_speed / constants::MUN_ORBIT_RADIUS;
     commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(constants::MUN_RADIUS))),
+        Mesh3d(meshes.add(Sphere::new(constants::MUN_RADIUS).mesh().ico(6).unwrap())),
         MeshMaterial3d(materials.add(Color::srgb(0.5, 0.5, 0.5))),
         Transform::from_xyz(constants::MUN_ORBIT_RADIUS, 0.0, 0.0),
         Collider::ball(constants::MUN_RADIUS),
-        RigidBody::Fixed,
+        RigidBody::KinematicPositionBased,
         CelestialBody {
             name: "Mun".to_string(),
             mu: mun_mu,
@@ -203,6 +256,32 @@ fn setup_scene(
             orbit_speed: mun_angular_speed,
             rotation_speed: 0.0,
         },
+        OrbitAngle(0.0),
+        OrbitParent(kerbin_entity),
+    ));
+
+    // Sun — orbits Kerbin in ECI frame, angular speed matches Kerbin rotation for day/night
+    commands.spawn((
+        Mesh3d(meshes.add(Sphere::new(constants::SUN_RADIUS).mesh().ico(6).unwrap())),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            emissive: LinearRgba::new(1.0, 0.95, 0.7, 1.0),
+            emissive_exposure_weight: 0.0,
+            ..default()
+        })),
+        Transform::from_xyz(constants::SUN_ORBIT_RADIUS, 0.0, 0.0),
+        CelestialBody {
+            name: "Sun".to_string(),
+            mu: 0.0,
+            radius: constants::SUN_RADIUS,
+            atmosphere_height: 0.0,
+            soi_radius: 0.0,
+            orbit_radius: constants::SUN_ORBIT_RADIUS,
+            orbit_speed: constants::KERBIN_ROTATION_SPEED,
+            rotation_speed: 0.0,
+        },
+        OrbitAngle(0.0),
+        OrbitParent(kerbin_entity),
+        SunMarker,
     ));
 
     let equator_rot = Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
@@ -220,7 +299,8 @@ fn setup_scene(
             illuminance: 10_000.,
             ..default()
         },
-        Transform::from_xyz(5.0, 10.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(constants::SUN_ORBIT_RADIUS, 0.0, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
+        SunLight,
     ));
 
     commands.spawn((
@@ -294,6 +374,27 @@ fn spawn_main_menu(mut commands: Commands, mut camera_q: Query<&mut OrbitCamera>
                 border: UiRect::all(Val::Px(2.0)),
                 ..default()
             },
+            BorderColor(Color::srgb(0.3, 0.5, 0.8)),
+            BackgroundColor(Color::srgb(0.15, 0.25, 0.45)),
+            MenuButton::Orbit,
+        )).with_children(|button| {
+            button.spawn((
+                Text::new("ORBIT"),
+                TextFont { font_size: 32.0, ..default() },
+                TextColor(Color::WHITE),
+            ));
+        });
+
+        parent.spawn((
+            Button,
+            Node {
+                width: Val::Px(220.0),
+                height: Val::Px(64.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
             BorderColor(Color::srgb(0.8, 0.3, 0.3)),
             BackgroundColor(Color::srgb(0.45, 0.15, 0.15)),
             MenuButton::Quit,
@@ -314,6 +415,7 @@ fn despawn_main_menu(mut commands: Commands, q: Query<Entity, With<MainMenuUI>>)
 }
 
 fn main_menu_button_system(
+    mut commands: Commands,
     q: Query<(&Interaction, &MenuButton), Changed<Interaction>>,
     mut next_state: ResMut<NextState<AppState>>,
     mut exit_events: EventWriter<AppExit>,
@@ -322,6 +424,10 @@ fn main_menu_button_system(
         if *interaction == Interaction::Pressed {
             match button {
                 MenuButton::Start => next_state.set(AppState::VAB),
+                MenuButton::Orbit => {
+                    commands.insert_resource(DebugLaunched);
+                    next_state.set(AppState::Flight);
+                }
                 MenuButton::Quit => { exit_events.send(AppExit::Success); }
             }
         }
@@ -436,5 +542,45 @@ fn camera_controller(
 
         transform.translation = position;
         transform.look_at(target_pos, up_dir);
+    }
+}
+
+// ===== Floating Origin =====
+
+fn floating_origin_system(
+    settings: Res<FloatingOriginSettings>,
+    mut offset: ResMut<FloatingOriginOffset>,
+    mut set: ParamSet<(
+        Query<&Transform, With<FloatingOrigin>>,
+        Query<&mut Transform>,
+    )>,
+) {
+    let pos = match set.p0().get_single() {
+        Ok(tf) => tf.translation,
+        Err(_) => return,
+    };
+    if pos.length() < settings.threshold { return; }
+
+    for mut tf in set.p1().iter_mut() {
+        tf.translation -= pos;
+    }
+
+    offset.0 += pos;
+    debug!("floating_origin: shifted by ({:.1},{:.1},{:.1}) | cumulative offset=({:.1},{:.1},{:.1})",
+        pos.x, pos.y, pos.z,
+        offset.0.x, offset.0.y, offset.0.z,
+    );
+}
+
+// ===== Sun Light =====
+
+fn sun_light_system(
+    sun_q: Query<&Transform, (With<SunMarker>, Without<SunLight>)>,
+    mut light_q: Query<&mut Transform, With<SunLight>>,
+) {
+    let Ok(sun_tf) = sun_q.get_single() else { return };
+    for mut light_tf in light_q.iter_mut() {
+        light_tf.translation = sun_tf.translation;
+        light_tf.look_at(Vec3::ZERO, Vec3::Y);
     }
 }

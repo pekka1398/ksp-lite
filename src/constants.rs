@@ -11,6 +11,11 @@ pub const MUN_RADIUS: f32 = 200.0;
 pub const MUN_SURFACE_GRAVITY: f32 = 1.0;
 pub const MUN_SOI_RADIUS: f32 = 2500.0;
 
+// ===== Sun =====
+
+pub const SUN_ORBIT_RADIUS: f32 = 50000.0;
+pub const SUN_RADIUS: f32 = 6000.0;
+
 // ===== Launch Pad =====
 
 pub const LAUNCH_PAD_WIDTH: f32 = 6.0;
@@ -72,7 +77,16 @@ pub const MANEUVER_TIME_STEP: f64 = 30.0;
 
 // ===== Time Warp =====
 
-pub const TIME_WARP_RATES: [f32; 5] = [1.0, 2.0, 5.0, 10.0, 20.0];
+pub const TIME_WARP_RATES: [f32; 4] = [1.0, 2.0, 5.0, 10.0];
+
+// ===== Floating Origin =====
+
+pub const FLOATING_ORIGIN_THRESHOLD: f32 = 50000.0;
+
+// ===== Debug =====
+
+/// Altitude above Mun surface for the debug orbit spawn.
+pub const DEBUG_ORBIT_ALTITUDE: f32 = 100.0;
 
 // ===== VAB =====
 

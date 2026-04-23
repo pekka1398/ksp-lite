@@ -365,6 +365,31 @@ pub fn orbit_prediction_system(
         gizmos.sphere(pe_pos, screen_marker_radius(cam_pos, pe_pos), Color::srgb(0.3, 0.6, 1.0));
     }
 
+    // Draw orbital paths for celestial bodies that orbit another body
+    for (body, _) in planet_q.iter() {
+        if body.orbit_radius > 0.0 {
+            // Find parent position — the body this one orbits
+            // For now, assume parent is at the position of the closest body with orbit_radius == 0
+            let parent_pos = planet_q.iter()
+                .find(|(b, _)| b.orbit_radius == 0.0 && b.name != body.name)
+                .map(|(_, tf)| tf.translation)
+                .unwrap_or(Vec3::ZERO);
+
+            let segments = 128;
+            let mut points = Vec::with_capacity(segments + 1);
+            for i in 0..=segments {
+                let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
+                let p = parent_pos + Vec3::new(
+                    body.orbit_radius * angle.cos(),
+                    0.0,
+                    body.orbit_radius * angle.sin(),
+                );
+                points.push(p);
+            }
+            gizmos.linestrip(points, Color::srgba(0.4, 0.4, 0.4, 0.5));
+        }
+    }
+
     let time_to_node = (maneuver.ut - now) as f32;
     if maneuver.is_active() && time_to_node <= 0.0 {
         warn!("Maneuver node expired (time_to_node={time_to_node:.1}s), auto-removing");
