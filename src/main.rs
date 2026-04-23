@@ -7,6 +7,7 @@ use bevy_rapier3d::prelude::*;
 mod vab;
 mod flight;
 mod orbit;
+mod constants;
 
 use vab::RocketConfig;
 use flight::PrePauseView;
@@ -46,7 +47,7 @@ pub struct TimeWarp {
 impl Default for TimeWarp {
     fn default() -> Self {
         Self {
-            rates: vec![1.0, 2.0, 5.0, 10.0, 20.0],
+            rates: constants::TIME_WARP_RATES.to_vec(),
             index: 0,
         }
     }
@@ -113,7 +114,7 @@ fn main() {
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
         .add_plugins(RapierDebugRenderPlugin::default())
         .insert_resource(TimestepMode::Interpolated {
-            dt: 1.0 / 60.0,
+            dt: 1.0 / 60.0, // physics timestep
             time_scale: 1.0,
             substeps: 1,
         })
@@ -163,47 +164,42 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let kerbin_radius = 2000.0;
-    let kerbin_g = 5.0;
-    let kerbin_mu = kerbin_g * kerbin_radius * kerbin_radius;
+    let kerbin_mu = constants::KERBIN_SURFACE_GRAVITY * constants::KERBIN_RADIUS * constants::KERBIN_RADIUS;
 
     commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(kerbin_radius))),
+        Mesh3d(meshes.add(Sphere::new(constants::KERBIN_RADIUS))),
         MeshMaterial3d(materials.add(Color::srgb(0.2, 0.6, 0.4))),
         Transform::from_xyz(0.0, 0.0, 0.0),
-        Collider::ball(kerbin_radius),
+        Collider::ball(constants::KERBIN_RADIUS),
         RigidBody::Fixed,
         CelestialBody {
             name: "Kerbin".to_string(),
             mu: kerbin_mu,
-            radius: kerbin_radius,
-            atmosphere_height: 150.0,
-            soi_radius: 16000.0,
+            radius: constants::KERBIN_RADIUS,
+            atmosphere_height: constants::KERBIN_ATMOSPHERE_HEIGHT,
+            soi_radius: constants::KERBIN_SOI_RADIUS,
             orbit_radius: 0.0,
             orbit_speed: 0.0,
-            rotation_speed: 0.025,
+            rotation_speed: constants::KERBIN_ROTATION_SPEED,
         },
     ));
 
-    let mun_orbit_radius = 14000.0;
-    let mun_radius = 200.0;
-    let mun_g = 1.0;
-    let mun_mu = mun_g * mun_radius * mun_radius;
-    let mun_orbital_speed = f32::sqrt(kerbin_mu / mun_orbit_radius);
-    let mun_angular_speed = mun_orbital_speed / mun_orbit_radius;
+    let mun_mu = constants::MUN_SURFACE_GRAVITY * constants::MUN_RADIUS * constants::MUN_RADIUS;
+    let mun_orbital_speed = f32::sqrt(kerbin_mu / constants::MUN_ORBIT_RADIUS);
+    let mun_angular_speed = mun_orbital_speed / constants::MUN_ORBIT_RADIUS;
     commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(mun_radius))),
+        Mesh3d(meshes.add(Sphere::new(constants::MUN_RADIUS))),
         MeshMaterial3d(materials.add(Color::srgb(0.5, 0.5, 0.5))),
-        Transform::from_xyz(mun_orbit_radius, 0.0, 0.0),
-        Collider::ball(mun_radius),
+        Transform::from_xyz(constants::MUN_ORBIT_RADIUS, 0.0, 0.0),
+        Collider::ball(constants::MUN_RADIUS),
         RigidBody::Fixed,
         CelestialBody {
             name: "Mun".to_string(),
             mu: mun_mu,
-            radius: mun_radius,
+            radius: constants::MUN_RADIUS,
             atmosphere_height: 0.0,
-            soi_radius: 2500.0,
-            orbit_radius: mun_orbit_radius,
+            soi_radius: constants::MUN_SOI_RADIUS,
+            orbit_radius: constants::MUN_ORBIT_RADIUS,
             orbit_speed: mun_angular_speed,
             rotation_speed: 0.0,
         },
@@ -211,11 +207,11 @@ fn setup_scene(
 
     let equator_rot = Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(6.0, 0.5, 6.0))),
+        Mesh3d(meshes.add(Cuboid::new(constants::LAUNCH_PAD_WIDTH, constants::LAUNCH_PAD_THICKNESS, constants::LAUNCH_PAD_WIDTH))),
         MeshMaterial3d(materials.add(Color::srgb(0.3, 0.3, 0.3))),
-        Transform::from_xyz(kerbin_radius + 0.25, 0.0, 0.0).with_rotation(equator_rot),
+        Transform::from_xyz(constants::LAUNCH_PAD_SURFACE_Y, 0.0, 0.0).with_rotation(equator_rot),
         RigidBody::Fixed,
-        Collider::cuboid(3.0, 0.25, 3.0),
+        Collider::cuboid(constants::LAUNCH_PAD_WIDTH / 2.0, constants::LAUNCH_PAD_THICKNESS / 2.0, constants::LAUNCH_PAD_WIDTH / 2.0),
     ));
 
     commands.spawn((
@@ -361,7 +357,7 @@ fn camera_controller(
     let dt = real_time.delta_secs();
 
     let (target_pos, up_dir) = if *state.get() == AppState::VAB {
-        (Vec3::new(2005.0, 0.0, 0.0), Vec3::X)
+        (Vec3::new(constants::VAB_ORIGIN_X, 0.0, 0.0), Vec3::X)
     } else if *state.get() == AppState::MapView {
         let rocket_pos = rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
         let (_, body_tf) = orbit::find_soi_body(rocket_pos, planet_query.iter());

@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 
 use crate::{AppState, OrbitCamera};
+use crate::constants::*;
 
 // ===== Components =====
 
@@ -152,7 +153,7 @@ fn vab_config_text(config: &RocketConfig) -> String {
             stage.stage_type.name(),
             stage.max_thrust as i32 / 1000,
             stage.fuel_mass as i32,
-            stage.max_thrust / (total_mass * 5.0),
+            stage.max_thrust / (total_mass * KERBIN_SURFACE_GRAVITY),
         ));
     }
 
@@ -168,16 +169,16 @@ fn spawn_vab_preview(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) {
-    let mat_upper = materials.add(Color::srgb(0.8, 0.8, 0.8));
-    let mat_booster = materials.add(Color::srgb(0.6, 0.6, 0.7));
-    let mat_heavy = materials.add(Color::srgb(0.7, 0.5, 0.3));
-    let mat_nose = materials.add(Color::srgb(0.9, 0.1, 0.1));
-    let mat_engine = materials.add(Color::srgb(0.2, 0.2, 0.2));
+    let mat_upper = materials.add(UPPER_STAGE_COLOR);
+    let mat_booster = materials.add(BOOSTER_COLOR);
+    let mat_heavy = materials.add(HEAVY_BOOSTER_COLOR);
+    let mat_nose = materials.add(NOSE_CONE_COLOR);
+    let mat_engine = materials.add(ENGINE_COLOR);
 
     let n_stages = config.stages.len();
     if n_stages == 0 { return; }
 
-    let stage_gap = 0.45;
+    let stage_gap = STAGE_GAP;
     let mut y_positions = Vec::with_capacity(n_stages);
     let mut y = 0.0;
     for i in (0..n_stages).rev() {
@@ -189,7 +190,7 @@ fn spawn_vab_preview(
     }
 
     let center_offset = (y_positions[0] + y_positions[n_stages - 1]) / 2.0;
-    let vab_origin = Vec3::new(2005.0, 0.0, 0.0);
+    let vab_origin = Vec3::new(VAB_ORIGIN_X, 0.0, 0.0);
 
     for i in 0..n_stages {
         let stage = &config.stages[i];
@@ -213,17 +214,17 @@ fn spawn_vab_preview(
 
         if is_top {
             entity_cmds.with_child((
-                Mesh3d(meshes.add(Cone { radius: stage.radius, height: stage.radius * 2.0 })),
+                Mesh3d(meshes.add(Cone { radius: stage.radius, height: stage.radius * NOSE_CONE_HEIGHT_FACTOR })),
                 MeshMaterial3d(mat_nose.clone()),
                 Transform::from_xyz(0.0, stage.height / 2.0 + stage.radius, 0.0),
             ));
         }
 
-        let nozzle_height = stage.radius * 0.8;
+        let nozzle_height = stage.radius * NOZZLE_HEIGHT_FACTOR;
         entity_cmds.with_child((
             Mesh3d(meshes.add(ConicalFrustum {
-                radius_top: stage.radius * 0.3,
-                radius_bottom: stage.radius * 0.6,
+                radius_top: stage.radius * NOZZLE_RADIUS_TOP_FACTOR,
+                radius_bottom: stage.radius * NOZZLE_RADIUS_BOTTOM_FACTOR,
                 height: nozzle_height,
             })),
             MeshMaterial3d(mat_engine.clone()),

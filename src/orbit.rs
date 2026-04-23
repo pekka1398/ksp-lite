@@ -2,6 +2,7 @@ use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
 use crate::{AppState, CelestialBody, Rocket};
+use crate::constants::*;
 
 // ===== Resources =====
 
@@ -34,7 +35,7 @@ impl ManeuverNode {
 
 /// Propagate a Keplerian orbit forward by `dt` seconds.
 pub fn propagate_kepler(pos: Vec3, vel: Vec3, mu: f32, dt: f32) -> (Vec3, Vec3) {
-    let steps = ((dt / 0.5).ceil() as usize).max(1);
+    let steps = ((dt / KEPLER_MAX_STEP_SIZE).ceil() as usize).max(1);
     let h = dt / steps as f32;
 
     let mut r = pos;
@@ -43,7 +44,7 @@ pub fn propagate_kepler(pos: Vec3, vel: Vec3, mu: f32, dt: f32) -> (Vec3, Vec3) 
     for _ in 0..steps {
         let accel = |r: Vec3| -> Vec3 {
             let r_mag = r.length();
-            if r_mag < 0.001 { return Vec3::ZERO; }
+            if r_mag < MIN_RADIUS_FOR_KEPLER { return Vec3::ZERO; }
             -mu * r / (r_mag * r_mag * r_mag)
         };
 
@@ -338,10 +339,10 @@ pub fn maneuver_node_system(
             *node = ManeuverNode::default();
         } else {
             *node = ManeuverNode {
-                prograde: 100.0,
+                prograde: DEFAULT_MANEUVER_PROGRADE,
                 normal: 0.0,
                 radial: 0.0,
-                ut: now + 300.0,
+                ut: now + DEFAULT_MANEUVER_TIME_OFFSET,
             };
         }
     }
@@ -351,7 +352,7 @@ pub fn maneuver_node_system(
     }
 
     if node.is_active() {
-        let dv_step = 50.0;
+        let dv_step = MANEUVER_DV_STEP;
         if keys.just_pressed(KeyCode::KeyI) { node.prograde += dv_step; }
         if keys.just_pressed(KeyCode::KeyK) { node.prograde -= dv_step; }
         if keys.just_pressed(KeyCode::KeyJ) { node.radial -= dv_step; }
@@ -359,7 +360,7 @@ pub fn maneuver_node_system(
         if keys.just_pressed(KeyCode::KeyU) { node.normal -= dv_step; }
         if keys.just_pressed(KeyCode::KeyO) { node.normal += dv_step; }
 
-        let time_step = 30.0_f64;
+        let time_step = MANEUVER_TIME_STEP;
         if keys.just_pressed(KeyCode::KeyT) { node.ut += time_step; }
         if keys.just_pressed(KeyCode::KeyG) { node.ut = (node.ut - time_step).max(now); }
     }

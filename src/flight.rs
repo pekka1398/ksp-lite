@@ -3,6 +3,7 @@ use bevy_rapier3d::prelude::*;
 
 use crate::{AppState, CelestialBody, Rocket, OrbitCamera, StageMarker, ExhaustFlame, FuelTank, Engine};
 use crate::vab::RocketConfig;
+use crate::constants::*;
 
 // ===== Components =====
 
@@ -40,30 +41,27 @@ pub fn spawn_flight(
         orbit.yaw = 0.0;
     }
 
-    let kerbin_radius = 2000.0;
     let equator_rot = Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
     let n_stages = config.stages.len();
     if n_stages == 0 { return; }
 
-    let stage_gap = 0.45;
-    let pad_clearance = 0.8;
-    let pad_top = 0.5;
+    let pad_top = LAUNCH_PAD_SURFACE_Y;
     let mut y_positions = Vec::with_capacity(n_stages);
-    let mut y = pad_top + pad_clearance;
+    let mut y = pad_top + PAD_CLEARANCE;
     for i in (0..n_stages).rev() {
         let h = config.stages[i].height;
         y += h / 2.0;
         y_positions.insert(0, y);
         y += h / 2.0;
-        y += stage_gap;
+        y += STAGE_GAP;
     }
 
-    let mat_upper = materials.add(Color::srgb(0.8, 0.8, 0.8));
-    let mat_lower = materials.add(Color::srgb(0.6, 0.6, 0.7));
-    let mat_heavy = materials.add(Color::srgb(0.7, 0.5, 0.3));
-    let mat_nose = materials.add(Color::srgb(0.9, 0.1, 0.1));
-    let mat_engine = materials.add(Color::srgb(0.2, 0.2, 0.2));
-    let mat_flame = materials.add(Color::srgb(1.0, 0.5, 0.0));
+    let mat_upper = materials.add(UPPER_STAGE_COLOR);
+    let mat_lower = materials.add(BOOSTER_COLOR);
+    let mat_heavy = materials.add(HEAVY_BOOSTER_COLOR);
+    let mat_nose = materials.add(NOSE_CONE_COLOR);
+    let mat_engine = materials.add(ENGINE_COLOR);
+    let mat_flame = materials.add(EXHAUST_FLAME_COLOR);
 
     let mut stage_entities = Vec::with_capacity(n_stages);
 
@@ -80,7 +78,7 @@ pub fn spawn_flight(
         let mut entity_cmds = commands.spawn((
             Mesh3d(meshes.add(Cylinder::new(stage.radius, stage.height))),
             MeshMaterial3d(stage_mat),
-            Transform::from_xyz(kerbin_radius + y, 0.0, 0.0).with_rotation(equator_rot),
+            Transform::from_xyz(y, 0.0, 0.0).with_rotation(equator_rot),
             RigidBody::Dynamic,
             GravityScale(0.0),
             Collider::cylinder(stage.height / 2.0, stage.radius),
@@ -107,7 +105,7 @@ pub fn spawn_flight(
                 current_stage: n_stages - 1,
             });
             entity_cmds.with_child((
-                Mesh3d(meshes.add(Cone { radius: stage.radius, height: stage.radius * 2.0 })),
+                Mesh3d(meshes.add(Cone { radius: stage.radius, height: stage.radius * NOSE_CONE_HEIGHT_FACTOR })),
                 MeshMaterial3d(mat_nose.clone()),
                 Transform::from_xyz(0.0, stage.height / 2.0 + stage.radius, 0.0),
                 Collider::cone(stage.radius, stage.radius),
@@ -115,22 +113,22 @@ pub fn spawn_flight(
             ));
         }
 
-        let nozzle_height = stage.radius * 0.8;
+        let nozzle_height = stage.radius * NOZZLE_HEIGHT_FACTOR;
         entity_cmds.with_child((
             Mesh3d(meshes.add(ConicalFrustum {
-                radius_top: stage.radius * 0.3,
-                radius_bottom: stage.radius * 0.6,
+                radius_top: stage.radius * NOZZLE_RADIUS_TOP_FACTOR,
+                radius_bottom: stage.radius * NOZZLE_RADIUS_BOTTOM_FACTOR,
                 height: nozzle_height,
             })),
             MeshMaterial3d(mat_engine.clone()),
             Transform::from_xyz(0.0, -stage.height / 2.0 - nozzle_height / 2.0, 0.0),
-            Collider::cylinder(nozzle_height / 2.0, stage.radius * 0.5),
+            Collider::cylinder(nozzle_height / 2.0, stage.radius * NOZZLE_COLLIDER_RADIUS_FACTOR),
             ColliderMassProperties::Mass(1.0),
         ));
 
         let flame_height = stage.height;
         entity_cmds.with_child((
-            Mesh3d(meshes.add(Cone { radius: stage.radius * 0.5, height: flame_height })),
+            Mesh3d(meshes.add(Cone { radius: stage.radius * EXHAUST_FLAME_RADIUS_FACTOR, height: flame_height })),
             MeshMaterial3d(mat_flame.clone()),
             Transform::from_xyz(0.0, -stage.height / 2.0 - nozzle_height - flame_height / 2.0, 0.0),
             Visibility::Hidden,
@@ -272,31 +270,29 @@ pub fn rocket_flight_system(
     if !rocket.is_launched { return; }
 
     if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
-        rocket.throttle += 0.5 * real_dt;
+        rocket.throttle += THROTTLE_CHANGE_RATE * real_dt;
     }
     if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
-        rocket.throttle -= 0.5 * real_dt;
+        rocket.throttle -= THROTTLE_CHANGE_RATE * real_dt;
     }
     if keys.just_pressed(KeyCode::KeyZ) { rocket.throttle = 1.0; }
     if keys.just_pressed(KeyCode::KeyX) { rocket.throttle = 0.0; }
     rocket.throttle = rocket.throttle.clamp(0.0, 1.0);
 
     let mut target_torque = Vec3::ZERO;
-    let torque_amount = 8000.0;
     let mut manual_input = false;
 
-    if keys.pressed(KeyCode::KeyW) { target_torque.x += torque_amount; manual_input = true; }
-    if keys.pressed(KeyCode::KeyS) { target_torque.x -= torque_amount; manual_input = true; }
-    if keys.pressed(KeyCode::KeyA) { target_torque.z += torque_amount; manual_input = true; }
-    if keys.pressed(KeyCode::KeyD) { target_torque.z -= torque_amount; manual_input = true; }
-    if keys.pressed(KeyCode::KeyQ) { target_torque.y += torque_amount; manual_input = true; }
-    if keys.pressed(KeyCode::KeyE) { target_torque.y -= torque_amount; manual_input = true; }
+    if keys.pressed(KeyCode::KeyW) { target_torque.x += ROCKET_TORQUE; manual_input = true; }
+    if keys.pressed(KeyCode::KeyS) { target_torque.x -= ROCKET_TORQUE; manual_input = true; }
+    if keys.pressed(KeyCode::KeyA) { target_torque.z += ROCKET_TORQUE; manual_input = true; }
+    if keys.pressed(KeyCode::KeyD) { target_torque.z -= ROCKET_TORQUE; manual_input = true; }
+    if keys.pressed(KeyCode::KeyQ) { target_torque.y += ROCKET_TORQUE; manual_input = true; }
+    if keys.pressed(KeyCode::KeyE) { target_torque.y -= ROCKET_TORQUE; manual_input = true; }
 
     let world_torque = if manual_input {
         rocket_tf.rotation * target_torque
     } else {
-        let damping_strength = 2000.0;
-        -rocket_vel.angvel * damping_strength
+        -rocket_vel.angvel * SAS_DAMPING
     };
 
     rocket_ext_force.torque = world_torque;
@@ -308,16 +304,16 @@ pub fn rocket_flight_system(
         let to_body = soi_tf.translation - pos;
         let dist = to_body.length();
         let dist_sq = dist * dist;
-        if dist_sq > 0.1 {
+        if dist_sq > MIN_DIST_SQ_FOR_GRAVITY {
             force += to_body.normalize() * (soi_body.mu * mass / dist_sq);
         }
         let altitude = dist - soi_body.radius;
         if altitude < soi_body.atmosphere_height && soi_body.atmosphere_height > 0.0 {
-            let scale_height = soi_body.atmosphere_height / 5.0;
+            let scale_height = soi_body.atmosphere_height / ATMOSPHERE_SCALE_HEIGHT_DIVISOR;
             let density = (-altitude / scale_height).exp();
             let velocity_sq = vel.linvel.length_squared();
-            if velocity_sq > 0.001 {
-                let drag_mag = 0.5 * density * velocity_sq * 0.5;
+            if velocity_sq > MIN_VELOCITY_SQ_FOR_DRAG {
+                let drag_mag = DRAG_COEFFICIENT * density * velocity_sq * 0.5;
                 force += -vel.linvel.normalize() * drag_mag;
             }
         }
@@ -355,7 +351,7 @@ pub fn rocket_flight_system(
         let body_mass = if let ColliderMassProperties::Mass(m) = *mass_props { m } else { 1.0 };
         total_force += compute_gravity_and_drag(transform.translation, body_mass, &velocity);
 
-        if ext_force.force.distance_squared(total_force) > 0.001 {
+        if ext_force.force.distance_squared(total_force) > FORCE_UPDATE_THRESHOLD_SQ {
             ext_force.force = total_force;
         }
     }
@@ -416,7 +412,7 @@ pub fn telemetry_system(
     let surface_vel = (velocity.linvel - local_up * vertical_vel).length();
 
     let density = if altitude < planet.atmosphere_height && planet.atmosphere_height > 0.0 {
-        let scale_height = planet.atmosphere_height / 5.0;
+        let scale_height = planet.atmosphere_height / ATMOSPHERE_SCALE_HEIGHT_DIVISOR;
         (-altitude / scale_height).exp()
     } else {
         0.0
