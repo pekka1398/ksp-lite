@@ -360,11 +360,11 @@ fn camera_controller(
         (Vec3::new(constants::VAB_ORIGIN_X, 0.0, 0.0), Vec3::X)
     } else if *state.get() == AppState::MapView {
         let rocket_pos = rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
-        let (_, body_tf) = orbit::find_soi_body(rocket_pos, planet_query.iter());
+        let (_, body_tf) = orbit::find_soi_body(rocket_pos, planet_query.iter(), false);
         (body_tf.translation, Vec3::Y)
     } else {
         let rocket_pos = rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
-        let (_, body_tf) = orbit::find_soi_body(rocket_pos, planet_query.iter());
+        let (_, body_tf) = orbit::find_soi_body(rocket_pos, planet_query.iter(), false);
         let up = (rocket_pos - body_tf.translation).try_normalize().unwrap_or(Vec3::Y);
         (rocket_pos, up)
     };

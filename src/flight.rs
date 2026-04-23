@@ -297,7 +297,7 @@ pub fn rocket_flight_system(
 
     rocket_ext_force.torque = world_torque;
 
-    let (soi_body, soi_tf) = crate::orbit::find_soi_body(rocket_tf.translation, planet_q.iter());
+    let (soi_body, soi_tf) = crate::orbit::find_soi_body(rocket_tf.translation, planet_q.iter(), false);
 
     let compute_gravity_and_drag = |pos: Vec3, mass: f32, vel: &Velocity| -> Vec3 {
         let mut force = Vec3::ZERO;
@@ -395,7 +395,7 @@ pub fn telemetry_system(
         }
     }
 
-    let (planet, p_transform) = crate::orbit::find_soi_body(transform.translation, planet_q.iter());
+    let (planet, p_transform) = crate::orbit::find_soi_body(transform.translation, planet_q.iter(), false);
 
     let planet_center = p_transform.translation;
     let to_planet = transform.translation - planet_center;
@@ -482,7 +482,7 @@ pub fn time_warp_system(
     planet_q: Query<(&CelestialBody, &Transform), Without<Rocket>>,
 ) {
     if let Ok(rocket_tf) = rocket_q.get_single() {
-        let (body, body_tf) = crate::orbit::find_soi_body(rocket_tf.translation, planet_q.iter());
+        let (body, body_tf) = crate::orbit::find_soi_body(rocket_tf.translation, planet_q.iter(), false);
         let altitude = (rocket_tf.translation - body_tf.translation).length() - body.radius;
         if altitude < body.atmosphere_height && body.atmosphere_height > 0.0 {
             if time_warp.index > 0 {
