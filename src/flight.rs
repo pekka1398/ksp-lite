@@ -28,6 +28,7 @@ pub fn spawn_flight(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     config: Res<RocketConfig>,
     mut camera_q: Query<&mut OrbitCamera>,
     rocket_q: Query<(), With<Rocket>>,
@@ -202,6 +203,9 @@ pub fn spawn_flight(
             TextColor(Color::srgb(0.8, 0.8, 0.8)),
         ));
     });
+
+    // Navball
+    crate::navball::spawn_navball(&mut commands, &mut images);
 }
 
 pub fn cleanup_game(

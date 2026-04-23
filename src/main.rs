@@ -3,12 +3,15 @@ use bevy::ecs::system::ParamSet;
 use bevy::time::Real;
 use bevy::ecs::event::EventReader;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
+use bevy::core_pipeline::Skybox;
 use bevy_rapier3d::prelude::*;
 
 mod vab;
 mod flight;
 mod orbit;
 mod constants;
+mod starfield;
+mod navball;
 
 use vab::RocketConfig;
 use flight::PrePauseView;
@@ -192,6 +195,7 @@ fn main() {
                 orbit::maneuver_node_system.run_if(in_state(AppState::MapView)),
                 flight::pause_menu_system,
                 flight::debug_orbit_apply_system,
+                navball::navball_system,
             ),
         )
         .add_systems(
@@ -216,6 +220,7 @@ fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     let kerbin_mu = constants::KERBIN_SURFACE_GRAVITY * constants::KERBIN_RADIUS * constants::KERBIN_RADIUS;
 
@@ -303,6 +308,9 @@ fn setup_scene(
         SunLight,
     ));
 
+    // Starfield — procedural cubemap skybox (must be on camera entity)
+    let skybox_handle = starfield::create_starfield_cubemap(&mut images);
+
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(5000.0, 2000.0, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
@@ -310,6 +318,11 @@ fn setup_scene(
             distance: 5000.0,
             pitch: 0.3,
             yaw: 0.0,
+        },
+        Skybox {
+            image: skybox_handle,
+            brightness: 500.0,
+            rotation: Quat::IDENTITY,
         },
     ));
 }

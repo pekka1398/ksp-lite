@@ -83,6 +83,10 @@ pub const TIME_WARP_RATES: [f32; 4] = [1.0, 2.0, 5.0, 10.0];
 
 pub const FLOATING_ORIGIN_THRESHOLD: f32 = 50000.0;
 
+// ===== Starfield =====
+
+pub const STARFIELD_COUNT: usize = 3000;
+
 // ===== Debug =====
 
 /// Altitude above Mun surface for the debug orbit spawn.
