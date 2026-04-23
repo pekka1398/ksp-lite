@@ -17,6 +17,10 @@ struct PauseMenuUI;
 
 // MapViewCamera removed — was defined but never spawned or queried.
 
+/// Remembers which view was active before pausing, so ESC returns to the same one.
+#[derive(Resource, Default)]
+struct PrePauseView(AppState);
+
 #[derive(Resource)]
 struct TimeWarp {
     rates: Vec<f32>,
@@ -122,6 +126,7 @@ fn main() {
         .init_state::<AppState>()
         .init_resource::<TimeWarp>()
         .init_resource::<ManeuverNode>()
+        .init_resource::<PrePauseView>()
         .add_systems(Startup, setup_scene)
         .add_systems(
             Update,
@@ -853,29 +858,42 @@ fn draw_orbit_gizmo(
     mu: f32,
     planet_center: Vec3,
     planet_radius: f32,
+    soi_radius: f32,
     color: Color,
 ) -> ApPe {
     let altitude = pos.length() - planet_radius;
     let speed = vel.length();
-    if altitude < 10.0 || speed < 10.0 { return ApPe { apoapsis: None, periapsis: None }; }
+    if altitude < 10.0 || speed < 10.0 {
+        if speed > 0.0 {
+            warn!("draw_orbit_gizmo skipped: altitude={altitude:.1}, speed={speed:.1}");
+        }
+        return ApPe { apoapsis: None, periapsis: None };
+    }
 
     let h = pos.cross(vel);
     let h_mag = h.length();
-    if h_mag < 0.001 { return ApPe { apoapsis: None, periapsis: None }; }
+    if h_mag < 0.001 {
+        warn!("draw_orbit_gizmo skipped: h_mag={h_mag:.4} (degenerate orbit)");
+        return ApPe { apoapsis: None, periapsis: None };
+    }
 
     let e_vec = (vel.cross(h) / mu) - pos.normalize();
     let e = e_vec.length();
     let energy = vel.length_squared() / 2.0 - mu / pos.length();
 
-    let a = if (1.0 - e).abs() < 0.001 {
-        1000000.0
-    } else if e < 1.0 {
-        -mu / (2.0 * energy)
+    let a = if e < 1.0 {
+        -mu / (2.0 * energy)   // Elliptic: a > 0
     } else {
-        mu / (2.0 * energy.abs())
+        mu / (2.0 * energy.abs()) // Hyperbolic: treat a as positive for drawing
     };
 
-    let p = e_vec.normalize_or(Vec3::X);
+    let p = if e > 0.0001 {
+        e_vec.normalize()
+    } else {
+        // Near-circular: pos is always in the orbital plane (h ⊥ pos),
+        // use it as an arbitrary in-plane reference direction.
+        pos.normalize_or(Vec3::X)
+    };
     let q = h.cross(p).normalize();
 
     // Compute Ap/Pe positions along the eccentricity vector direction
@@ -883,8 +901,8 @@ fn draw_orbit_gizmo(
         let r_ap = a * (1.0 + e);
         let r_pe = a * (1.0 - e);
         ApPe {
-            apoapsis: Some(planet_center + p * r_ap),
-            periapsis: Some(planet_center - p * r_pe),
+            apoapsis: Some(planet_center - p * r_ap),
+            periapsis: Some(planet_center + p * r_pe),
         }
     } else {
         ApPe { apoapsis: None, periapsis: None }
@@ -911,7 +929,7 @@ fn draw_orbit_gizmo(
         for i in 0..=num_segments {
             let nu = -render_nu + (i as f32 / num_segments as f32) * (2.0 * render_nu);
             let r_mag = (a * (e * e - 1.0)) / (1.0 + e * nu.cos());
-            if r_mag > 5000.0 || r_mag < 0.0 { continue; }
+            if r_mag > soi_radius || r_mag < 0.0 { continue; }
             let local_pos = p * (r_mag * nu.cos()) + q * (r_mag * nu.sin());
             points.push(planet_center + local_pos);
         }
@@ -970,7 +988,7 @@ fn orbit_prediction_system(
     let mu = planet.mu;
 
     // Draw current orbit (cyan) and get Ap/Pe
-    let ap_pe = draw_orbit_gizmo(&mut gizmos, pos, vel, mu, planet_tf.translation, planet.radius, Color::srgb(0.0, 0.8, 1.0));
+    let ap_pe = draw_orbit_gizmo(&mut gizmos, pos, vel, mu, planet_tf.translation, planet.radius, planet.soi_radius, Color::srgb(0.0, 0.8, 1.0));
 
     // Ship marker (green diamond)
     gizmos.sphere(com_pos, 10.0, Color::srgb(0.0, 1.0, 0.0));
@@ -988,6 +1006,7 @@ fn orbit_prediction_system(
     let time_to_node = (maneuver.ut - now) as f32;
     if maneuver.is_active() && time_to_node <= 0.0 {
         // Node is in the past — auto-remove
+        warn!("Maneuver node expired (time_to_node={time_to_node:.1}s), auto-removing");
         *maneuver = ManeuverNode::default();
     }
     if maneuver.is_active() {
@@ -1014,7 +1033,7 @@ fn orbit_prediction_system(
                 let h_mag = h.length();
                 if h_mag > 0.001 {
                     let normal_dir = h.normalize();
-                    let radial_dir = normal_dir.cross(prograde_dir).normalize();
+                    let radial_dir = prograde_dir.cross(normal_dir).normalize();
 
                     let maneuver_dv = prograde_dir * maneuver.prograde
                         + normal_dir * maneuver.normal
@@ -1028,6 +1047,7 @@ fn orbit_prediction_system(
                         mu,
                         planet_tf.translation,
                         planet.radius,
+                        planet.soi_radius,
                         Color::srgb(1.0, 0.9, 0.0),
                     );
 
@@ -1042,8 +1062,14 @@ fn orbit_prediction_system(
                     if let Some(pe_pos) = mnv_ap_pe.periapsis {
                         gizmos.sphere(pe_pos, marker_size, Color::srgb(0.3, 0.5, 1.0));
                     }
+                } else {
+                    warn!("Maneuver orbit skipped: h_mag={h_mag:.4} at propagated position (degenerate)");
                 }
+            } else {
+                warn!("Maneuver orbit skipped: future_speed={future_speed:.2} (too low after propagation)");
             }
+        } else {
+            warn!("Maneuver orbit skipped: current speed={speed:.2} (too low to propagate)");
         }
     }
 }
@@ -1069,16 +1095,17 @@ fn pause_menu_system(
     mut time: ResMut<Time<Virtual>>,
     mut menu_q: Query<&mut Visibility, With<PauseMenuUI>>,
     mut exit_events: EventWriter<AppExit>,
+    mut pre_pause: ResMut<PrePauseView>,
 ) {
     let Ok(mut menu_vis) = menu_q.get_single_mut() else { return };
 
     match state.get() {
         AppState::Paused => {
-            // Resume
+            // Resume — return to whichever view was active before pausing
             if keys.just_pressed(KeyCode::Escape) {
                 time.unpause();
                 *menu_vis = Visibility::Hidden;
-                next_state.set(AppState::Flight);
+                next_state.set(pre_pause.0);
             }
             // Flight View (also resumes)
             if keys.just_pressed(KeyCode::Digit1) {
@@ -1099,6 +1126,7 @@ fn pause_menu_system(
         }
         AppState::Flight | AppState::MapView => {
             if keys.just_pressed(KeyCode::Escape) {
+                pre_pause.0 = *state.get();
                 time.pause();
                 *menu_vis = Visibility::Visible;
                 next_state.set(AppState::Paused);
