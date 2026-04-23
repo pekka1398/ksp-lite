@@ -167,6 +167,7 @@ struct CelestialBody {
     soi_radius: f32, // sphere of influence radius
     orbit_radius: f32, // distance from parent body (0 if root)
     orbit_speed: f32, // angular velocity around parent (rad/s, 0 if root)
+    rotation_speed: f32, // sidereal rotation angular velocity (rad/s)
 }
 
 /// Find the dominant SOI body for a given world position from an iterator of (CelestialBody, Transform).
@@ -199,13 +200,22 @@ fn find_soi_body<'a>(
     soi.or(nearest).unwrap()
 }
 
-/// Compute the world-space velocity of a celestial body.
+/// Compute the world-space velocity of a celestial body (orbital motion).
 fn soi_body_velocity(body: &CelestialBody, body_tf: &Transform) -> Vec3 {
     if body.orbit_radius > 0.0 && body.orbit_speed > 0.0 {
         body.orbit_speed * Vec3::new(-body_tf.translation.z, 0.0, body_tf.translation.x)
     } else {
         Vec3::ZERO
     }
+}
+
+/// Compute the surface rotation velocity at a world position on a rotating body.
+/// The rotation axis is +Y (poles at ±Y), so equatorial velocity is tangential in XZ.
+fn surface_rotation_velocity(body: &CelestialBody, pos: Vec3) -> Vec3 {
+    if body.rotation_speed == 0.0 { return Vec3::ZERO; }
+    // ω along +Y, position relative to body center
+    // v = ω × r = ω * (-z, 0, x)
+    body.rotation_speed * Vec3::new(-pos.z, 0.0, pos.x)
 }
 
 #[derive(Component)]
@@ -264,6 +274,7 @@ fn setup_scene(
             soi_radius: 16000.0,
             orbit_radius: 0.0,
             orbit_speed: 0.0,
+            rotation_speed: 0.025, // ~50 m/s equatorial surface velocity
         },
     ));
 
@@ -288,6 +299,7 @@ fn setup_scene(
             soi_radius: 2500.0,
             orbit_radius: mun_orbit_radius,
             orbit_speed: mun_angular_speed,
+            rotation_speed: 0.0, // Tidally locked — same as orbit_speed in theory
         },
     ));
 
@@ -665,7 +677,11 @@ fn telemetry_system(
     let dist = to_planet.length();
     let local_up = if dist > 0.0 { to_planet / dist } else { Vec3::Y };
     let altitude = dist - planet.radius;
-    let vel_mag = velocity.linvel.length();
+
+    // Inertial velocity (for orbital calculations) = physical vel + surface rotation
+    let rel_pos = transform.translation - planet_center;
+    let inertial_vel = velocity.linvel + surface_rotation_velocity(planet, rel_pos);
+    let orbital_vel_mag = inertial_vel.length();
 
     let pitch_deg = transform.up().dot(local_up).asin().to_degrees();
     let vertical_vel = velocity.linvel.dot(local_up);
@@ -678,15 +694,13 @@ fn telemetry_system(
         0.0
     };
 
-    // Compute Ap/Pe altitudes from orbital elements
-    let rel_pos = transform.translation - planet_center;
-    let rel_vel = velocity.linvel;
+    // Compute Ap/Pe altitudes from orbital elements (use inertial velocity)
     let ap_pe_str = {
-        let h = rel_pos.cross(rel_vel);
+        let h = rel_pos.cross(inertial_vel);
         let h_mag = h.length();
-        let e_vec = if h_mag > 0.001 { (rel_vel.cross(h) / planet.mu) - rel_pos.normalize() } else { Vec3::ZERO };
+        let e_vec = if h_mag > 0.001 { (inertial_vel.cross(h) / planet.mu) - rel_pos.normalize() } else { Vec3::ZERO };
         let e = e_vec.length();
-        let energy = rel_vel.length_squared() / 2.0 - planet.mu / rel_pos.length();
+        let energy = inertial_vel.length_squared() / 2.0 - planet.mu / rel_pos.length();
         let a = if e < 1.0 && energy.abs() > 0.001 { -planet.mu / (2.0 * energy) } else { 0.0 };
         if e > 0.001 && e < 1.0 && a > 0.0 {
             let r_ap = a * (1.0 + e);
@@ -724,7 +738,7 @@ fn telemetry_system(
         rocket.current_stage,
         altitude,
         pitch_deg,
-        vel_mag,
+        orbital_vel_mag,
         surface_vel,
         vertical_vel,
         rocket.throttle * 100.0,
@@ -986,7 +1000,8 @@ fn orbit_prediction_system(
     let (planet, planet_tf) = find_soi_body(com_pos, planet_q.iter());
 
     let pos = com_pos - planet_tf.translation;
-    let vel = com_vel - soi_body_velocity(planet, planet_tf);
+    // Inertial velocity = physical velocity - orbital velocity of body + surface rotation
+    let vel = com_vel - soi_body_velocity(planet, planet_tf) + surface_rotation_velocity(planet, pos);
     let mu = planet.mu;
 
     // Draw current orbit (cyan) and get Ap/Pe
