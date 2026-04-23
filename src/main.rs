@@ -4,18 +4,53 @@ use bevy::ecs::event::EventReader;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy_rapier3d::prelude::*;
 
+// ===== States =====
+
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, States)]
 enum AppState {
     #[default]
+    MainMenu,
+    VAB,
     Flight,
     MapView,
     Paused,
 }
 
+// ===== Component Markers =====
+
+#[derive(Component)]
+struct MainMenuUI;
+
+#[derive(Component)]
+struct VabUI;
+
+#[derive(Component)]
+struct VabConfigText;
+
+#[derive(Component)]
+struct FlightEntity;
+
 #[derive(Component)]
 struct PauseMenuUI;
 
-// MapViewCamera removed — was defined but never spawned or queried.
+#[derive(Component)]
+struct TelemetryUI;
+
+#[derive(Component)]
+enum MenuButton {
+    Start,
+    Quit,
+}
+
+#[derive(Component)]
+enum VabButton {
+    AddStage,
+    RemoveStage,
+    Launch,
+    Back,
+}
+
+// ===== Resources =====
 
 /// Remembers which view was active before pausing, so ESC returns to the same one.
 #[derive(Resource, Default)]
@@ -39,6 +74,56 @@ impl Default for TimeWarp {
 impl TimeWarp {
     fn rate(&self) -> f32 {
         self.rates[self.index]
+    }
+}
+
+#[derive(Resource, Clone, Debug)]
+struct RocketConfig {
+    stages: Vec<StageConfig>,
+}
+
+#[derive(Clone, Debug)]
+struct StageConfig {
+    dry_mass: f32,
+    fuel_mass: f32,
+    max_thrust: f32,
+    fuel_burn_rate: f32,
+    radius: f32,
+    height: f32,
+}
+
+impl StageConfig {
+    fn default_upper() -> Self {
+        Self {
+            dry_mass: 600.0,
+            fuel_mass: 400.0,
+            max_thrust: 12000.0,
+            fuel_burn_rate: 6.0,
+            radius: 0.5,
+            height: 1.0,
+        }
+    }
+
+    fn default_booster() -> Self {
+        Self {
+            dry_mass: 600.0,
+            fuel_mass: 1000.0,
+            max_thrust: 40000.0,
+            fuel_burn_rate: 18.0,
+            radius: 0.5,
+            height: 2.0,
+        }
+    }
+}
+
+impl Default for RocketConfig {
+    fn default() -> Self {
+        Self {
+            stages: vec![
+                StageConfig::default_upper(),
+                StageConfig::default_booster(),
+            ],
+        }
     }
 }
 
@@ -69,6 +154,55 @@ impl ManeuverNode {
         self.ut >= 0.0
     }
 }
+
+// ===== Game Components =====
+
+#[derive(Component)]
+struct OrbitCamera {
+    distance: f32,
+    pitch: f32,
+    yaw: f32,
+}
+
+#[derive(Component)]
+struct CelestialBody {
+    name: String,
+    mu: f32,
+    radius: f32,
+    atmosphere_height: f32,
+    soi_radius: f32,
+    orbit_radius: f32,
+    orbit_speed: f32,
+    rotation_speed: f32,
+}
+
+#[derive(Component)]
+struct Rocket {
+    is_launched: bool,
+    throttle: f32,
+    current_stage: usize,
+}
+
+#[derive(Component)]
+struct FuelTank {
+    fuel_mass: f32,
+    dry_mass: f32,
+}
+
+#[derive(Component)]
+struct Engine {
+    max_thrust: f32,
+    fuel_burn_rate: f32,
+    stage: usize,
+}
+
+#[derive(Component)]
+struct StageMarker(usize);
+
+#[derive(Component)]
+struct ExhaustFlame(usize);
+
+// ===== Helper Functions =====
 
 /// Propagate a Keplerian orbit forward by `dt` seconds.
 /// Returns (new_position, new_velocity) relative to the central body.
@@ -107,67 +241,6 @@ fn propagate_kepler(pos: Vec3, vel: Vec3, mu: f32, dt: f32) -> (Vec3, Vec3) {
     }
 
     (r, v)
-}
-
-fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins)
-        .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
-        .add_plugins(RapierDebugRenderPlugin::default())
-        // Use Interpolated timestep: it accumulates virtual time and runs
-        // multiple fixed-dt steps per frame, which actually speeds up physics
-        // when Time<Virtual>::relative_speed > 1. Variable mode's max_dt
-        // cap would clamp the step and negate any time warp.
-        .insert_resource(TimestepMode::Interpolated {
-            dt: 1.0 / 60.0,
-            time_scale: 1.0,
-            substeps: 1,
-        })
-        .init_state::<AppState>()
-        .init_resource::<TimeWarp>()
-        .init_resource::<ManeuverNode>()
-        .init_resource::<PrePauseView>()
-        .add_systems(Startup, setup_scene)
-        .add_systems(
-            Update,
-            (
-                celestial_orbit_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
-                rocket_flight_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
-                telemetry_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
-                orbit_prediction_system.run_if(in_state(AppState::MapView)),
-                map_view_toggle_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
-                time_warp_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
-                maneuver_node_system.run_if(in_state(AppState::MapView)),
-                pause_menu_system,
-            ),
-        )
-        .add_systems(
-            PostUpdate,
-            camera_controller
-                .after(PhysicsSet::Writeback)
-                .before(TransformSystem::TransformPropagate),
-        )
-        .run();
-}
-
-/// A simple camera component to allow orbital controls later
-#[derive(Component)]
-struct OrbitCamera {
-    distance: f32,
-    pitch: f32,
-    yaw: f32,
-}
-
-#[derive(Component)]
-struct CelestialBody {
-    name: String,
-    mu: f32, // standard gravitational parameter
-    radius: f32,
-    atmosphere_height: f32,
-    soi_radius: f32, // sphere of influence radius
-    orbit_radius: f32, // distance from parent body (0 if root)
-    orbit_speed: f32, // angular velocity around parent (rad/s, 0 if root)
-    rotation_speed: f32, // sidereal rotation angular velocity (rad/s)
 }
 
 /// Find the dominant SOI body for a given world position from an iterator of (CelestialBody, Transform).
@@ -218,46 +291,107 @@ fn surface_rotation_velocity(body: &CelestialBody, pos: Vec3) -> Vec3 {
     body.rotation_speed * Vec3::new(-pos.z, 0.0, pos.x)
 }
 
-#[derive(Component)]
-struct Rocket {
-    is_launched: bool,
-    throttle: f32,
-    current_stage: usize,
+fn compute_total_dv(config: &RocketConfig) -> f32 {
+    let mut dv = 0.0;
+    let mut remaining_mass: f32 = config.stages.iter().map(|s| s.dry_mass + s.fuel_mass).sum();
+    for i in (0..config.stages.len()).rev() {
+        let stage = &config.stages[i];
+        let ve = stage.max_thrust / stage.fuel_burn_rate;
+        let m0 = remaining_mass;
+        let m1 = remaining_mass - stage.fuel_mass;
+        if m1 > 0.0 && m0 > m1 {
+            dv += ve * (m0 / m1).ln();
+        }
+        remaining_mass -= stage.dry_mass + stage.fuel_mass;
+    }
+    dv
 }
 
-#[derive(Component)]
-struct FuelTank {
-    fuel_mass: f32,
-    dry_mass: f32,
+fn vab_config_text(config: &RocketConfig) -> String {
+    let mut s = String::from("Rocket Configuration\n\n");
+    let total_mass: f32 = config.stages.iter().map(|s| s.dry_mass + s.fuel_mass).sum();
+
+    for (i, stage) in config.stages.iter().enumerate() {
+        let label = if i == 0 {
+            "Upper"
+        } else if i == config.stages.len() - 1 && config.stages.len() > 1 {
+            "Booster"
+        } else {
+            "Mid"
+        };
+        s.push_str(&format!(
+            "Stage {} ({}): {}kN | Fuel: {}kg\n",
+            i, label, stage.max_thrust as i32 / 1000, stage.fuel_mass as i32
+        ));
+    }
+
+    let dv = compute_total_dv(config);
+    s.push_str(&format!("\nTotal Mass: {}kg\nEst. Delta-V: {:.0} m/s", total_mass as i32, dv));
+    s
 }
 
-#[derive(Component)]
-struct Engine {
-    max_thrust: f32,
-    fuel_burn_rate: f32,
-    stage: usize,
+// ===== Main =====
+
+fn main() {
+    App::new()
+        .add_plugins(DefaultPlugins)
+        .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
+        .add_plugins(RapierDebugRenderPlugin::default())
+        .insert_resource(TimestepMode::Interpolated {
+            dt: 1.0 / 60.0,
+            time_scale: 1.0,
+            substeps: 1,
+        })
+        .init_state::<AppState>()
+        .init_resource::<TimeWarp>()
+        .init_resource::<ManeuverNode>()
+        .init_resource::<PrePauseView>()
+        .init_resource::<RocketConfig>()
+        // Startup: world only (planet, mun, pad, light, camera)
+        .add_systems(Startup, setup_scene)
+        // State transitions
+        .add_systems(OnEnter(AppState::MainMenu), spawn_main_menu)
+        .add_systems(OnExit(AppState::MainMenu), despawn_main_menu)
+        .add_systems(OnEnter(AppState::VAB), spawn_vab)
+        .add_systems(OnExit(AppState::VAB), despawn_vab)
+        .add_systems(OnEnter(AppState::Flight), spawn_flight)
+        .add_systems(OnEnter(AppState::MainMenu), cleanup_game)
+        .add_systems(OnEnter(AppState::VAB), cleanup_game)
+        // Update systems
+        .add_systems(
+            Update,
+            (
+                main_menu_button_system.run_if(in_state(AppState::MainMenu)),
+                vab_button_system.run_if(in_state(AppState::VAB)),
+                celestial_orbit_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
+                rocket_flight_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
+                telemetry_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
+                orbit_prediction_system.run_if(in_state(AppState::MapView)),
+                map_view_toggle_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
+                time_warp_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
+                maneuver_node_system.run_if(in_state(AppState::MapView)),
+                pause_menu_system,
+            ),
+        )
+        .add_systems(
+            PostUpdate,
+            camera_controller
+                .after(PhysicsSet::Writeback)
+                .before(TransformSystem::TransformPropagate),
+        )
+        .run();
 }
 
-#[derive(Component)]
-struct StageMarker(usize);
-
-#[derive(Component)]
-struct ExhaustFlame(usize);
-
-#[derive(Component)]
-struct TelemetryUI;
+// ===== Scene Setup (world only) =====
 
 fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // --- World Constants ---
     let kerbin_radius = 2000.0;
     let kerbin_g = 5.0;
-    let kerbin_mu = kerbin_g * kerbin_radius * kerbin_radius; // 20,000,000
-    // Rotation to make local +Y point along world +X (radially outward at equator)
-    let equator_rot = Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
+    let kerbin_mu = kerbin_g * kerbin_radius * kerbin_radius;
 
     // Planet (Sphere) — Kerbin
     commands.spawn((
@@ -274,7 +408,7 @@ fn setup_scene(
             soi_radius: 16000.0,
             orbit_radius: 0.0,
             orbit_speed: 0.0,
-            rotation_speed: 0.025, // ~50 m/s equatorial surface velocity
+            rotation_speed: 0.025,
         },
     ));
 
@@ -282,7 +416,7 @@ fn setup_scene(
     let mun_orbit_radius = 14000.0;
     let mun_radius = 200.0;
     let mun_g = 1.0;
-    let mun_mu = mun_g * mun_radius * mun_radius; // 40,000
+    let mun_mu = mun_g * mun_radius * mun_radius;
     let mun_orbital_speed = f32::sqrt(kerbin_mu / mun_orbit_radius);
     let mun_angular_speed = mun_orbital_speed / mun_orbit_radius;
     commands.spawn((
@@ -299,11 +433,12 @@ fn setup_scene(
             soi_radius: 2500.0,
             orbit_radius: mun_orbit_radius,
             orbit_speed: mun_angular_speed,
-            rotation_speed: 0.0, // Tidally locked — same as orbit_speed in theory
+            rotation_speed: 0.0,
         },
     ));
 
     // Launch Pad — on the equator at +X
+    let equator_rot = Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(6.0, 0.5, 6.0))),
         MeshMaterial3d(materials.add(Color::srgb(0.3, 0.3, 0.3))),
@@ -312,18 +447,7 @@ fn setup_scene(
         Collider::cuboid(3.0, 0.25, 3.0),
     ));
 
-    // Rocket mass/thrust constants
-    let s0_dry = 600.0;
-    let s0_fuel = 400.0;
-    let s0_thrust = 12000.0;
-    let s0_burn_rate = 6.0;
-
-    let s1_dry = 600.0;
-    let s1_fuel = 1000.0;
-    let s1_thrust = 40000.0;
-    let s1_burn_rate = 18.0;
-
-    // A simple directional light
+    // Directional light
     commands.spawn((
         DirectionalLight {
             shadows_enabled: true,
@@ -333,109 +457,443 @@ fn setup_scene(
         Transform::from_xyz(5.0, 10.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
+    // Camera (persistent across states, controller adjusts behavior per state)
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(5000.0, 2000.0, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
+        OrbitCamera {
+            distance: 5000.0,
+            pitch: 0.3,
+            yaw: 0.0,
+        },
+    ));
+}
+
+// ===== Main Menu =====
+
+fn spawn_main_menu(mut commands: Commands, mut camera_q: Query<&mut OrbitCamera>) {
+    for mut orbit in camera_q.iter_mut() {
+        orbit.distance = 5000.0;
+        orbit.pitch = 0.3;
+        orbit.yaw = 0.0;
+    }
+
+    commands.spawn((
+        Node {
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::Center,
+            row_gap: Val::Px(24.0),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.0, 0.0, 0.05, 0.85)),
+        MainMenuUI,
+    )).with_children(|parent| {
+        parent.spawn((
+            Text::new("KSP-LITE"),
+            TextFont { font_size: 72.0, ..default() },
+            TextColor(Color::WHITE),
+            Node { margin: UiRect::bottom(Val::Px(40.0)), ..default() },
+        ));
+
+        // Start button
+        parent.spawn((
+            Button,
+            Node {
+                width: Val::Px(220.0),
+                height: Val::Px(64.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            BorderColor(Color::srgb(0.3, 0.8, 0.4)),
+            BackgroundColor(Color::srgb(0.15, 0.45, 0.2)),
+            MenuButton::Start,
+        )).with_children(|button| {
+            button.spawn((
+                Text::new("START"),
+                TextFont { font_size: 32.0, ..default() },
+                TextColor(Color::WHITE),
+            ));
+        });
+
+        // Quit button
+        parent.spawn((
+            Button,
+            Node {
+                width: Val::Px(220.0),
+                height: Val::Px(64.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            BorderColor(Color::srgb(0.8, 0.3, 0.3)),
+            BackgroundColor(Color::srgb(0.45, 0.15, 0.15)),
+            MenuButton::Quit,
+        )).with_children(|button| {
+            button.spawn((
+                Text::new("QUIT"),
+                TextFont { font_size: 32.0, ..default() },
+                TextColor(Color::WHITE),
+            ));
+        });
+    });
+}
+
+fn despawn_main_menu(mut commands: Commands, q: Query<Entity, With<MainMenuUI>>) {
+    if let Ok(entity) = q.get_single() {
+        commands.entity(entity).despawn_recursive();
+    }
+}
+
+fn main_menu_button_system(
+    q: Query<(&Interaction, &MenuButton), Changed<Interaction>>,
+    mut next_state: ResMut<NextState<AppState>>,
+    mut exit_events: EventWriter<AppExit>,
+) {
+    for (interaction, button) in q.iter() {
+        if *interaction == Interaction::Pressed {
+            match button {
+                MenuButton::Start => next_state.set(AppState::VAB),
+                MenuButton::Quit => { exit_events.send(AppExit::Success); }
+            }
+        }
+    }
+}
+
+// ===== VAB =====
+
+fn spawn_vab(mut commands: Commands, config: Res<RocketConfig>, mut camera_q: Query<&mut OrbitCamera>) {
+    for mut orbit in camera_q.iter_mut() {
+        orbit.distance = 20.0;
+        orbit.pitch = 0.2;
+        orbit.yaw = 0.0;
+    }
+
+    let config_display = vab_config_text(&config);
+
+    commands.spawn((
+        Node {
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::Center,
+            row_gap: Val::Px(16.0),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.02, 0.02, 0.06, 0.9)),
+        VabUI,
+    )).with_children(|parent| {
+        parent.spawn((
+            Text::new("VEHICLE ASSEMBLY"),
+            TextFont { font_size: 48.0, ..default() },
+            TextColor(Color::WHITE),
+            Node { margin: UiRect::bottom(Val::Px(20.0)), ..default() },
+        ));
+
+        // Stage count + add/remove buttons row
+        parent.spawn((
+            Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(12.0),
+                ..default()
+            },
+        )).with_children(|row| {
+            row.spawn((
+                Text::new("Stages:"),
+                TextFont { font_size: 24.0, ..default() },
+                TextColor(Color::srgb(0.8, 0.8, 0.8)),
+            ));
+
+            row.spawn((
+                Button,
+                Node {
+                    width: Val::Px(48.0),
+                    height: Val::Px(40.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.6, 0.3, 0.1)),
+                VabButton::RemoveStage,
+            )).with_children(|btn| {
+                btn.spawn((
+                    Text::new("-"),
+                    TextFont { font_size: 28.0, ..default() },
+                    TextColor(Color::WHITE),
+                ));
+            });
+
+            row.spawn((
+                Button,
+                Node {
+                    width: Val::Px(48.0),
+                    height: Val::Px(40.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.1, 0.4, 0.6)),
+                VabButton::AddStage,
+            )).with_children(|btn| {
+                btn.spawn((
+                    Text::new("+"),
+                    TextFont { font_size: 28.0, ..default() },
+                    TextColor(Color::WHITE),
+                ));
+            });
+        });
+
+        // Config display
+        parent.spawn((
+            Text::new(config_display),
+            TextFont { font_size: 20.0, ..default() },
+            TextColor(Color::srgb(0.7, 0.9, 0.7)),
+            VabConfigText,
+            Node { margin: UiRect::bottom(Val::Px(24.0)), ..default() },
+        ));
+
+        // Launch button
+        parent.spawn((
+            Button,
+            Node {
+                width: Val::Px(220.0),
+                height: Val::Px(64.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            BorderColor(Color::srgb(0.3, 0.8, 0.4)),
+            BackgroundColor(Color::srgb(0.15, 0.45, 0.2)),
+            VabButton::Launch,
+        )).with_children(|btn| {
+            btn.spawn((
+                Text::new("LAUNCH"),
+                TextFont { font_size: 32.0, ..default() },
+                TextColor(Color::WHITE),
+            ));
+        });
+
+        // Back button
+        parent.spawn((
+            Button,
+            Node {
+                width: Val::Px(220.0),
+                height: Val::Px(48.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(2.0)),
+                ..default()
+            },
+            BorderColor(Color::srgb(0.4, 0.4, 0.4)),
+            BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
+            VabButton::Back,
+        )).with_children(|btn| {
+            btn.spawn((
+                Text::new("BACK"),
+                TextFont { font_size: 24.0, ..default() },
+                TextColor(Color::srgb(0.7, 0.7, 0.7)),
+            ));
+        });
+    });
+}
+
+fn despawn_vab(mut commands: Commands, q: Query<Entity, With<VabUI>>) {
+    if let Ok(entity) = q.get_single() {
+        commands.entity(entity).despawn_recursive();
+    }
+}
+
+fn vab_button_system(
+    interaction_q: Query<(&Interaction, &VabButton), Changed<Interaction>>,
+    mut config: ResMut<RocketConfig>,
+    mut next_state: ResMut<NextState<AppState>>,
+    mut text_q: Query<&mut Text, With<VabConfigText>>,
+    keys: Res<ButtonInput<KeyCode>>,
+) {
+    // ESC goes back to main menu
+    if keys.just_pressed(KeyCode::Escape) {
+        next_state.set(AppState::MainMenu);
+        return;
+    }
+
+    let mut config_changed = false;
+
+    for (interaction, button) in interaction_q.iter() {
+        if *interaction != Interaction::Pressed { continue; }
+        match button {
+            VabButton::AddStage => {
+                config.stages.push(StageConfig::default_booster());
+                config_changed = true;
+            }
+            VabButton::RemoveStage => {
+                if config.stages.len() > 1 {
+                    config.stages.pop();
+                    config_changed = true;
+                }
+            }
+            VabButton::Launch => {
+                next_state.set(AppState::Flight);
+            }
+            VabButton::Back => {
+                next_state.set(AppState::MainMenu);
+            }
+        }
+    }
+
+    if config_changed {
+        if let Ok(mut text) = text_q.get_single_mut() {
+            text.0 = vab_config_text(&config);
+        }
+    }
+}
+
+// ===== Flight =====
+
+fn spawn_flight(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    config: Res<RocketConfig>,
+    mut camera_q: Query<&mut OrbitCamera>,
+) {
+    for mut orbit in camera_q.iter_mut() {
+        orbit.distance = 20.0;
+        orbit.pitch = 0.2;
+        orbit.yaw = 0.0;
+    }
+
+    let kerbin_radius = 2000.0;
+    let equator_rot = Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
+    let n_stages = config.stages.len();
+    if n_stages == 0 { return; }
+
+    // Compute Y positions for each stage (local frame, stacking along radial axis)
+    // Stage 0 = top, Stage N-1 = bottom
+    // Must leave gaps between colliders to prevent Rapier jitter.
+    // Original hardcoded values: pad top at +0.5, stage 1 center at +2.3, stage 0 center at +4.25
+    // giving ~0.8 gap above pad, ~0.45 gap between stages.
+    let stage_gap = 0.45;
+    let pad_clearance = 0.8;
+    let pad_top = 0.5; // pad center +0.25, half-height 0.25
+    let mut y_positions = Vec::with_capacity(n_stages);
+    let mut y = pad_top + pad_clearance; // start above pad
+    for i in (0..n_stages).rev() {
+        let h = config.stages[i].height;
+        y += h / 2.0;  // move to center
+        y_positions.insert(0, y);
+        y += h / 2.0;  // move past this stage
+        y += stage_gap; // gap before next stage
+    }
+
     let mat_upper = materials.add(Color::srgb(0.8, 0.8, 0.8));
     let mat_lower = materials.add(Color::srgb(0.6, 0.6, 0.7));
     let mat_nose = materials.add(Color::srgb(0.9, 0.1, 0.1));
     let mat_engine = materials.add(Color::srgb(0.2, 0.2, 0.2));
     let mat_flame = materials.add(Color::srgb(1.0, 0.5, 0.0));
 
-    // --- STAGE 0 (Upper Stage + Capsule) ---
-    let stage0_entity = commands.spawn((
-        Mesh3d(meshes.add(Cylinder::new(0.5, 1.0))),
-        MeshMaterial3d(mat_upper.clone()),
-        Transform::from_xyz(kerbin_radius + 4.25, 0.0, 0.0).with_rotation(equator_rot),
-        RigidBody::Dynamic,
-        GravityScale(0.0),
-        Collider::cylinder(0.5, 0.5),
-        ColliderMassProperties::Mass(s0_dry + s0_fuel),
-        ExternalForce::default(),
-        Velocity::default(),
-        Rocket {
-            throttle: 0.0,
-            is_launched: false,
-            current_stage: 1,
-        },
-        FuelTank {
-            fuel_mass: s0_fuel,
-            dry_mass: s0_dry,
-        },
-        Engine {
-            max_thrust: s0_thrust,
-            fuel_burn_rate: s0_burn_rate,
-            stage: 0,
-        },
-        StageMarker(0),
-    )).with_child((
-        Mesh3d(meshes.add(Cone { radius: 0.5, height: 1.0 })),
-        MeshMaterial3d(mat_nose),
-        Transform::from_xyz(0.0, 1.0, 0.0),
-        Collider::cone(0.5, 0.5),
-        ColliderMassProperties::Mass(1.0),
-    )).with_child((
-        Mesh3d(meshes.add(ConicalFrustum { radius_top: 0.15, radius_bottom: 0.3, height: 0.4 })),
-        MeshMaterial3d(mat_engine.clone()),
-        Transform::from_xyz(0.0, -0.7, 0.0),
-        Collider::cylinder(0.2, 0.3),
-        ColliderMassProperties::Mass(1.0),
-    )).with_child((
-        Mesh3d(meshes.add(Cone { radius: 0.25, height: 2.0 })),
-        MeshMaterial3d(mat_flame.clone()),
-        Transform::from_xyz(0.0, -1.7, 0.0),
-        Visibility::Hidden,
-        ExhaustFlame(0),
-    )).id();
+    let mut stage_entities = Vec::with_capacity(n_stages);
 
-    // --- STAGE 1 (Booster) ---
-    let stage1_entity = commands.spawn((
-        Mesh3d(meshes.add(Cylinder::new(0.5, 2.0))),
-        MeshMaterial3d(mat_lower),
-        Transform::from_xyz(kerbin_radius + 2.3, 0.0, 0.0).with_rotation(equator_rot),
-        RigidBody::Dynamic,
-        GravityScale(0.0),
-        Collider::cylinder(1.0, 0.5),
-        ColliderMassProperties::Mass(s1_dry + s1_fuel),
-        ExternalForce::default(),
-        Velocity::default(),
-        FuelTank {
-            fuel_mass: s1_fuel,
-            dry_mass: s1_dry,
-        },
-        Engine {
-            max_thrust: s1_thrust,
-            fuel_burn_rate: s1_burn_rate,
-            stage: 1,
-        },
-        StageMarker(1),
-    )).with_child((
-        Mesh3d(meshes.add(ConicalFrustum { radius_top: 0.25, radius_bottom: 0.5, height: 0.8 })),
-        MeshMaterial3d(mat_engine),
-        Transform::from_xyz(0.0, -1.4, 0.0),
-        Collider::cylinder(0.4, 0.4),
-        ColliderMassProperties::Mass(1.0),
-    )).with_child((
-        Mesh3d(meshes.add(Cone { radius: 0.4, height: 3.0 })),
-        MeshMaterial3d(mat_flame),
-        Transform::from_xyz(0.0, -2.9, 0.0),
-        Visibility::Hidden,
-        ExhaustFlame(1),
-    )).id();
+    for i in 0..n_stages {
+        let stage = &config.stages[i];
+        let is_top = i == 0;
+        let stage_mat = if is_top { mat_upper.clone() } else { mat_lower.clone() };
+        let y = y_positions[i];
 
-    // Joint them together matching reference logic
-    let joint = FixedJointBuilder::new()
-        .local_anchor1(Vec3::new(0.0, -0.95, 0.0)) // Match reference stage 0 anchor
-        .local_anchor2(Vec3::new(0.0, 1.0, 0.0));  // Match reference stage 1 anchor
-    commands.entity(stage1_entity).insert(ImpulseJoint::new(stage0_entity, joint));
+        let mut entity_cmds = commands.spawn((
+            Mesh3d(meshes.add(Cylinder::new(stage.radius, stage.height))),
+            MeshMaterial3d(stage_mat),
+            Transform::from_xyz(kerbin_radius + y, 0.0, 0.0).with_rotation(equator_rot),
+            RigidBody::Dynamic,
+            GravityScale(0.0),
+            Collider::cylinder(stage.height / 2.0, stage.radius),
+            ColliderMassProperties::Mass(stage.dry_mass + stage.fuel_mass),
+            ExternalForce::default(),
+            Velocity::default(),
+            FuelTank {
+                fuel_mass: stage.fuel_mass,
+                dry_mass: stage.dry_mass,
+            },
+            Engine {
+                max_thrust: stage.max_thrust,
+                fuel_burn_rate: stage.fuel_burn_rate,
+                stage: i,
+            },
+            StageMarker(i),
+            FlightEntity,
+        ));
 
-    // Camera
-    commands.spawn((
-        Camera3d::default(),
-        Transform::from_xyz(kerbin_radius + 5.0, 5.0, 15.0).looking_at(Vec3::new(kerbin_radius, 0.0, 0.0), Vec3::Y),
-        OrbitCamera {
-            distance: 20.0,
-            pitch: 0.2,
-            yaw: 0.0,
-        },
-    ));
+        // Top stage gets the Rocket component + nose cone
+        if is_top {
+            entity_cmds.insert(Rocket {
+                throttle: 0.0,
+                is_launched: false,
+                current_stage: n_stages - 1,
+            });
+            entity_cmds.with_child((
+                Mesh3d(meshes.add(Cone { radius: stage.radius, height: stage.radius * 2.0 })),
+                MeshMaterial3d(mat_nose.clone()),
+                Transform::from_xyz(0.0, stage.height / 2.0 + stage.radius, 0.0),
+                Collider::cone(stage.radius, stage.radius),
+                ColliderMassProperties::Mass(1.0),
+            ));
+        }
+
+        // Every stage gets engine nozzle + flame
+        let nozzle_height = stage.radius * 0.8;
+        entity_cmds.with_child((
+            Mesh3d(meshes.add(ConicalFrustum {
+                radius_top: stage.radius * 0.3,
+                radius_bottom: stage.radius * 0.6,
+                height: nozzle_height,
+            })),
+            MeshMaterial3d(mat_engine.clone()),
+            Transform::from_xyz(0.0, -stage.height / 2.0 - nozzle_height / 2.0, 0.0),
+            Collider::cylinder(nozzle_height / 2.0, stage.radius * 0.5),
+            ColliderMassProperties::Mass(1.0),
+        ));
+
+        let flame_height = stage.height;
+        entity_cmds.with_child((
+            Mesh3d(meshes.add(Cone { radius: stage.radius * 0.5, height: flame_height })),
+            MeshMaterial3d(mat_flame.clone()),
+            Transform::from_xyz(0.0, -stage.height / 2.0 - nozzle_height - flame_height / 2.0, 0.0),
+            Visibility::Hidden,
+            ExhaustFlame(i),
+        ));
+
+        stage_entities.push(entity_cmds.id());
+    }
+
+    // Create joints between adjacent stages (lower entity holds the joint)
+    // Joint connection point = top of the lower stage's collider.
+    // This matches the original pattern where anchor1=(0, -0.95, 0), anchor2=(0, 1.0, 0)
+    // for a 0.45 gap between the upper bottom and lower top.
+    for i in 0..n_stages - 1 {
+        let upper = stage_entities[i];
+        let lower = stage_entities[i + 1];
+        let lower_height = config.stages[i + 1].height;
+
+        // Lower anchor: top of lower collider
+        let lower_anchor_y = lower_height / 2.0;
+        // Upper anchor: must map to same world point as lower anchor
+        // world_meeting = y_positions[i+1] + lower_anchor_y
+        // upper_anchor_y = world_meeting - y_positions[i]
+        let meeting_y = y_positions[i + 1] + lower_anchor_y;
+        let upper_anchor_y = meeting_y - y_positions[i];
+
+        let joint = FixedJointBuilder::new()
+            .local_anchor1(Vec3::new(0.0, upper_anchor_y, 0.0))
+            .local_anchor2(Vec3::new(0.0, lower_anchor_y, 0.0));
+        commands.entity(lower).insert(ImpulseJoint::new(upper, joint));
+    }
 
     // Telemetry UI
     commands.spawn((
@@ -452,6 +910,7 @@ fn setup_scene(
             ..default()
         },
         TelemetryUI,
+        FlightEntity,
     ));
 
     // Pause menu overlay
@@ -471,6 +930,7 @@ fn setup_scene(
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),
         Visibility::Hidden,
         PauseMenuUI,
+        FlightEntity,
     )).with_children(|parent| {
         parent.spawn((
             Text::new("PAUSED"),
@@ -478,12 +938,30 @@ fn setup_scene(
             TextColor(Color::WHITE),
         ));
         parent.spawn((
-            Text::new("[ESC] Resume\n[1] Flight View\n[2] Reset\n[3] Quit"),
+            Text::new("[ESC] Resume\n[1] Flight View\n[2] Main Menu\n[3] Quit"),
             TextFont { font_size: 24.0, ..default() },
             TextColor(Color::srgb(0.8, 0.8, 0.8)),
         ));
     });
 }
+
+fn cleanup_game(
+    mut commands: Commands,
+    game_entities: Query<Entity, With<FlightEntity>>,
+    mut time_warp: ResMut<TimeWarp>,
+    mut time: ResMut<Time<Virtual>>,
+    mut maneuver: ResMut<ManeuverNode>,
+) {
+    for entity in game_entities.iter() {
+        commands.entity(entity).despawn_recursive();
+    }
+    time_warp.index = 0;
+    time.set_relative_speed(1.0);
+    time.unpause();
+    *maneuver = ManeuverNode::default();
+}
+
+// ===== Flight Systems =====
 
 fn rocket_flight_system(
     real_time: Res<Time<Real>>,
@@ -511,12 +989,33 @@ fn rocket_flight_system(
         if !rocket.is_launched {
             rocket.is_launched = true;
         } else if rocket.current_stage > 0 {
-            for (joint_entity, joint) in joint_q.iter() {
-                if joint.parent == rocket_entity {
-                    commands.entity(joint_entity).remove::<ImpulseJoint>();
-                    rocket.current_stage -= 1;
-                    break;
+            // Collect all entities still attached to the rocket via joints.
+            // We need to find the bottommost attached stage and detach it.
+            // Joint structure: lower_stage holds ImpulseJoint with parent = upper entity.
+            // Walk the chain: rocket → first attached → next attached → ...
+            let mut attached_entities: Vec<Entity> = Vec::new();
+            let mut current = rocket_entity;
+            loop {
+                let mut found_next = None;
+                for (joint_entity, joint) in joint_q.iter() {
+                    // joint_entity holds the joint; joint.parent is who it's attached to
+                    if joint.parent == current && joint_entity != rocket_entity {
+                        found_next = Some(joint_entity);
+                        break;
+                    }
                 }
+                match found_next {
+                    Some(next) => {
+                        attached_entities.push(next);
+                        current = next;
+                    }
+                    None => break,
+                }
+            }
+            // The bottommost attached entity is the one to detach
+            if let Some(bottom) = attached_entities.last() {
+                commands.entity(*bottom).remove::<ImpulseJoint>();
+                rocket.current_stage -= 1;
             }
         }
     }
@@ -858,8 +1357,6 @@ fn maneuver_node_system(
     }
 }
 
-
-
 /// Ap/Pe world positions returned by draw_orbit_gizmo.
 struct ApPe {
     apoapsis: Option<Vec3>,
@@ -1130,11 +1627,11 @@ fn pause_menu_system(
                 *menu_vis = Visibility::Hidden;
                 next_state.set(AppState::Flight);
             }
-            // Reset: unpause and go to flight
+            // Main Menu
             if keys.just_pressed(KeyCode::Digit2) {
                 time.unpause();
                 *menu_vis = Visibility::Hidden;
-                next_state.set(AppState::Flight);
+                next_state.set(AppState::MainMenu);
             }
             // Quit
             if keys.just_pressed(KeyCode::Digit3) {
@@ -1164,6 +1661,29 @@ fn camera_controller(
     rocket_query: Query<&Transform, (With<Rocket>, Without<OrbitCamera>)>,
     planet_query: Query<(&CelestialBody, &Transform), (With<CelestialBody>, Without<OrbitCamera>)>,
 ) {
+    // Handle non-game states separately
+    if *state.get() == AppState::MainMenu {
+        for (mut transform, _) in query.iter_mut() {
+            let time = real_time.elapsed_secs();
+            let angle = time * 0.1;
+            let dist = 5000.0;
+            let x = dist * angle.cos();
+            let z = dist * angle.sin();
+            transform.translation = Vec3::new(x, 2000.0, z);
+            transform.look_at(Vec3::ZERO, Vec3::Y);
+        }
+        return;
+    }
+
+    if *state.get() == AppState::VAB {
+        let kerbin_radius = 2000.0;
+        for (mut transform, _) in query.iter_mut() {
+            transform.translation = Vec3::new(kerbin_radius + 10.0, 5.0, 15.0);
+            transform.look_at(Vec3::new(kerbin_radius, 0.0, 0.0), Vec3::X);
+        }
+        return;
+    }
+
     let dt = real_time.delta_secs();
 
     // Focus target and up direction depend on state
