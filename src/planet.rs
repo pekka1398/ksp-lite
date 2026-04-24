@@ -4,7 +4,6 @@ use bevy::render::render_resource::{AsBindGroup, ShaderRef, RenderPipelineDescri
 use bevy::render::mesh::{VertexAttributeValues, Indices, MeshVertexBufferLayoutRef};
 use bevy::render::render_resource::SpecializedMeshPipelineError;
 
-use crate::constants::*;
 
 // ===== Noise Settings =====
 
@@ -119,6 +118,10 @@ pub struct AtmosphereMaterial {
     pub color: LinearRgba,
     #[uniform(0)]
     pub camera_and_rim: Vec4, // xyz = camera position, w = rim power
+    #[uniform(0)]
+    pub sun_dir: Vec4,       // Use Vec4 for 16-byte alignment (w is unused)
+    #[uniform(0)]
+    pub radii: Vec4,         // x = planet/ocean radius, y = atmosphere radius
 }
 
 impl Material for AtmosphereMaterial {
@@ -194,16 +197,31 @@ pub struct AtmosphereMarker;
 
 pub fn update_atmosphere_camera(
     camera_q: Query<&GlobalTransform, With<Camera3d>>,
+    sun_q: Query<&Transform, With<crate::SunMarker>>,
+    terrain_config: Res<crate::TerrainConfig>,
     mut materials: ResMut<Assets<AtmosphereMaterial>>,
     atmosphere_q: Query<&MeshMaterial3d<AtmosphereMaterial>>,
 ) {
     let Ok(cam_gt) = camera_q.get_single() else { return };
     let cam_pos = cam_gt.translation();
+
+    let sun_dir = sun_q.get_single()
+        .map(|tf| tf.translation.normalize_or(Vec3::X))
+        .unwrap_or(Vec3::X);
+
+    // Base surface for atmosphere calculations is either the solid planet or the ocean surface, whichever is higher.
+    // This assumes the ocean completely covers the lowlands (offset by sea_level).
+    let surface_radius = crate::constants::KERBIN_RADIUS + terrain_config.sea_level;
+    // Make sure atmosphere radius shrinks or expands appropriately if surface_radius changes significantly
+    let atmosphere_radius = surface_radius + terrain_config.atmosphere_height * 0.7;
+
     for handle in atmosphere_q.iter() {
         if let Some(mat) = materials.get_mut(&handle.0) {
             mat.camera_and_rim.x = cam_pos.x;
             mat.camera_and_rim.y = cam_pos.y;
             mat.camera_and_rim.z = cam_pos.z;
+            mat.sun_dir = sun_dir.extend(0.0); // Convert Vec3 to Vec4
+            mat.radii = Vec4::new(surface_radius, atmosphere_radius, 0.0, 0.0);
         }
     }
 }

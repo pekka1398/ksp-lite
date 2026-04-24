@@ -106,7 +106,6 @@ pub const STARFIELD_COUNT: usize = 3000;
 
 // ===== Terrain =====
 
-pub const TERRAIN_MAX_HEIGHT: f32 = 180.0;
 pub const TERRAIN_SEA_LEVEL_NOISE: f32 = 0.45;
 pub const KERBIN_MESH_SEGMENTS: u32 = 512;
 pub const KERBIN_MESH_RINGS: u32 = 256;

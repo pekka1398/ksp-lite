@@ -83,6 +83,7 @@ impl TimeWarp {
 pub struct TerrainConfig {
     pub max_height_ratio: f32, // 山高佔半徑的比例
     pub sea_level: f32,
+    pub atmosphere_height: f32,
     pub ocean_depth_multiplier: f32,
     pub ocean_floor_smoothing: f32,
     pub mountain_blend: f32,
@@ -96,6 +97,7 @@ impl Default for TerrainConfig {
         Self {
             max_height_ratio: 0.09, // 180 / 2000
             sea_level: constants::TERRAIN_SEA_LEVEL_NOISE,
+            atmosphere_height: constants::KERBIN_ATMOSPHERE_HEIGHT,
             ocean_depth_multiplier: 1.0,
             ocean_floor_smoothing: 0.2,
             mountain_blend: 1.0,
@@ -389,6 +391,8 @@ fn setup_scene(
         MeshMaterial3d(atmosphere_materials.add(planet::AtmosphereMaterial {
             color: LinearRgba::new(0.3, 0.6, 1.0, 0.6),
             camera_and_rim: Vec4::new(0.0, 0.0, 0.0, constants::ATMOSPHERE_RIM_POWER),
+            sun_dir: Vec4::X,
+            radii: Vec4::new(constants::KERBIN_RADIUS, constants::KERBIN_ATMOSPHERE_VISUAL_RADIUS, 0.0, 0.0),
         })),
         Transform::from_xyz(0.0, 0.0, 0.0).with_rotation(kerbin_pole_rot),
         planet::AtmosphereMarker,
@@ -993,7 +997,8 @@ fn terrain_debug_system(
     mut config: ResMut<TerrainConfig>,
     mut meshes: ResMut<Assets<Mesh>>,
     planet_q: Query<&Mesh3d, With<CelestialBody>>,
-    mut ocean_q: Query<&mut Transform, (With<planet::OceanMarker>, Without<CelestialBody>)>,
+    mut ocean_q: Query<&mut Transform, (With<planet::OceanMarker>, Without<CelestialBody>, Without<planet::AtmosphereMarker>)>,
+    mut atmo_q: Query<&mut Transform, (With<planet::AtmosphereMarker>, Without<CelestialBody>, Without<planet::OceanMarker>)>,
 ) {
     let mut changed = false;
 
@@ -1001,6 +1006,7 @@ fn terrain_debug_system(
         ui.heading("Global & Ocean Mask");
         if ui.add(egui::Slider::new(&mut config.max_height_ratio, 0.0..=0.3).text("Max Height Ratio")).changed() { changed = true; }
         if ui.add(egui::Slider::new(&mut config.sea_level, -500.0..=500.0).text("Sea Level Offset")).changed() { changed = true; }
+        if ui.add(egui::Slider::new(&mut config.atmosphere_height, 0.0..=500.0).text("Atmosphere Height")).changed() { changed = true; }
         if ui.add(egui::Slider::new(&mut config.ocean_depth_multiplier, 0.0..=10.0).text("Ocean Depth Multiplier")).changed() { changed = true; }
         if ui.add(egui::Slider::new(&mut config.ocean_floor_smoothing, 0.001..=1.0).text("Ocean Floor Smoothing")).changed() { changed = true; }
         if ui.add(egui::Slider::new(&mut config.mountain_blend, 0.0..=2.0).text("Mountain Blend Weight")).changed() { changed = true; }
@@ -1054,10 +1060,18 @@ fn terrain_debug_system(
         }
     }
 
-    // 實時更新海洋半徑
+    // 實時更新海洋半徑與大氣半徑
     for mut tf in ocean_q.iter_mut() {
         let base_radius = constants::OCEAN_RADIUS;
         let target_radius = constants::KERBIN_RADIUS + config.sea_level;
+        let scale = target_radius / base_radius;
+        tf.scale = Vec3::splat(scale);
+    }
+
+    for mut tf in atmo_q.iter_mut() {
+        let base_radius = constants::KERBIN_ATMOSPHERE_VISUAL_RADIUS;
+        let surface_radius = constants::KERBIN_RADIUS + config.sea_level;
+        let target_radius = surface_radius + config.atmosphere_height * 0.7;
         let scale = target_radius / base_radius;
         tf.scale = Vec3::splat(scale);
     }
