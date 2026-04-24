@@ -141,6 +141,20 @@ impl Default for FloatingOriginSettings {
     }
 }
 
+#[derive(Resource, Default)]
+pub struct MapFocus {
+    /// What to focus on in map view. None = focus on rocket's SOI body.
+    pub target: MapFocusTarget,
+}
+
+#[derive(Default)]
+pub enum MapFocusTarget {
+    #[default]
+    SoiBody,
+    Body(Entity),
+    Rocket,
+}
+
 #[derive(Component)]
 pub struct OrbitAngle(pub f32);
 
@@ -175,6 +189,7 @@ fn main() {
         .init_resource::<RocketConfig>()
         .init_resource::<FloatingOriginOffset>()
         .init_resource::<FloatingOriginSettings>()
+        .init_resource::<MapFocus>()
         .add_systems(Startup, setup_scene)
         // State transitions — cleanup before spawn so floating origin resets first
         .add_systems(OnEnter(AppState::MainMenu), flight::cleanup_game)
@@ -197,8 +212,10 @@ fn main() {
                 flight::map_view_toggle_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
                 flight::time_warp_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
                 orbit::maneuver_node_system.run_if(in_state(AppState::MapView)),
+                orbit::map_focus_click_system.run_if(in_state(AppState::MapView)),
                 flight::pause_menu_system,
                 flight::debug_orbit_apply_system,
+                flight::map_icon_system,
                 navball::navball_system,
             ),
         )
@@ -701,11 +718,12 @@ fn camera_controller(
     keys: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     state: Res<State<AppState>>,
+    map_focus: Res<MapFocus>,
     mut mouse_motion_events: EventReader<MouseMotion>,
     mut mouse_wheel_events: EventReader<MouseWheel>,
     mut query: Query<(&mut Transform, &mut OrbitCamera)>,
     rocket_query: Query<&Transform, (With<Rocket>, Without<OrbitCamera>)>,
-    planet_query: Query<(&CelestialBody, &Transform), (With<CelestialBody>, Without<OrbitCamera>)>,
+    planet_query: Query<(Entity, &CelestialBody, &Transform), (With<CelestialBody>, Without<OrbitCamera>)>,
 ) {
     if *state.get() == AppState::MainMenu {
         for (mut transform, _) in query.iter_mut() {
@@ -725,12 +743,29 @@ fn camera_controller(
     let (target_pos, up_dir) = if *state.get() == AppState::VAB {
         (Vec3::new(constants::VAB_ORIGIN_X, 0.0, 0.0), Vec3::X)
     } else if *state.get() == AppState::MapView {
-        let rocket_pos = rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
-        let (_, body_tf) = orbit::find_soi_body(rocket_pos, planet_query.iter(), false);
-        (body_tf.translation, Vec3::Y)
+        let focus_pos = match &map_focus.target {
+            MapFocusTarget::Body(entity) => {
+                planet_query.get(*entity).ok().map(|(_, _, tf)| tf.translation)
+            }
+            MapFocusTarget::Rocket => {
+                rocket_query.get_single().ok().map(|t| t.translation)
+            }
+            MapFocusTarget::SoiBody => {
+                let rocket_pos = rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
+                let (_, body_tf) = orbit::find_soi_body(rocket_pos, planet_query.iter().map(|(_, b, t)| (b, t)), false);
+                Some(body_tf.translation)
+            }
+        };
+        if let Some(pos) = focus_pos {
+            (pos, Vec3::Y)
+        } else {
+            let rocket_pos = rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
+            let (_, body_tf) = orbit::find_soi_body(rocket_pos, planet_query.iter().map(|(_, b, t)| (b, t)), false);
+            (body_tf.translation, Vec3::Y)
+        }
     } else {
         let rocket_pos = rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
-        let (_, body_tf) = orbit::find_soi_body(rocket_pos, planet_query.iter(), false);
+        let (_, body_tf) = orbit::find_soi_body(rocket_pos, planet_query.iter().map(|(_, b, t)| (b, t)), false);
         let up = (rocket_pos - body_tf.translation).try_normalize().unwrap_or(Vec3::Y);
         (rocket_pos, up)
     };

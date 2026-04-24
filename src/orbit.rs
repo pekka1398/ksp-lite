@@ -1,7 +1,8 @@
 use bevy::prelude::*;
+use bevy::input::ButtonState;
 use bevy_rapier3d::prelude::*;
 
-use crate::{AppState, CelestialBody, Rocket, OrbitInclination};
+use crate::{AppState, CelestialBody, Rocket, OrbitInclination, MapFocus, MapFocusTarget};
 use crate::constants::*;
 
 // ===== Resources =====
@@ -366,7 +367,7 @@ pub fn orbit_prediction_system(
     }
 
     // Draw orbital paths for celestial bodies that orbit another body
-    for (body, _, inclination) in planet_q.iter() {
+    for (body, _tf, inclination) in planet_q.iter() {
         if body.orbit_radius > 0.0 {
             // Find parent position — the body this one orbits
             let parent_pos = planet_q.iter()
@@ -394,6 +395,8 @@ pub fn orbit_prediction_system(
             gizmos.linestrip(points, Color::srgba(0.4, 0.4, 0.4, 0.5));
         }
     }
+
+    // Celestial body icons are drawn by map_icon_system in UI layer
 
     let time_to_node = (maneuver.ut - now) as f32;
     if maneuver.is_active() && time_to_node <= 0.0 {
@@ -523,5 +526,72 @@ pub fn maneuver_node_system(
         let time_step = MANEUVER_TIME_STEP;
         if keys.just_pressed(KeyCode::KeyT) { node.ut += time_step; debug!("maneuver_node: ut+={time_step} -> {}", node.ut); }
         if keys.just_pressed(KeyCode::KeyG) { node.ut = (node.ut - time_step).max(now); debug!("maneuver_node: ut-={time_step} -> {}", node.ut); }
+    }
+}
+
+pub fn map_focus_click_system(
+    _mouse_buttons: Res<ButtonInput<MouseButton>>,
+    mut mouse_click_events: EventReader<bevy::input::mouse::MouseButtonInput>,
+    windows: Query<&Window>,
+    camera_q: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    planet_q: Query<(Entity, &CelestialBody, &Transform)>,
+    rocket_q: Query<&Transform, With<Rocket>>,
+    mut map_focus: ResMut<MapFocus>,
+    state: Res<State<AppState>>,
+) {
+    if *state.get() != AppState::MapView { return; }
+
+    // Detect left click (just pressed)
+    let mut clicked = false;
+    for event in mouse_click_events.read() {
+        if event.button == MouseButton::Left && event.state == ButtonState::Pressed {
+            clicked = true;
+        }
+    }
+    if !clicked { return; }
+
+    let Ok(window) = windows.get_single() else { return };
+    let Some(cursor_pos) = window.cursor_position() else { return };
+    let Ok((camera, camera_gt)) = camera_q.get_single() else { return };
+
+    // Click threshold in screen pixels
+    const CLICK_RADIUS: f32 = 30.0;
+    let mut best_entity: Option<Entity> = None;
+    let mut best_dist: f32 = CLICK_RADIUS;
+
+    for (entity, _body, tf) in planet_q.iter() {
+        // Project world position to screen
+        let Ok(screen_pos) = camera.world_to_viewport(camera_gt, tf.translation) else {
+            continue;
+        };
+        let dx = screen_pos.x - cursor_pos.x;
+        let dy = screen_pos.y - cursor_pos.y;
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist < best_dist {
+            best_dist = dist;
+            best_entity = Some(entity);
+        }
+    }
+
+    // Also check rocket position — click on rocket to focus it
+    let mut clicked_rocket = false;
+    if let Ok(rocket_tf) = rocket_q.get_single() {
+        if let Ok(screen_pos) = camera.world_to_viewport(camera_gt, rocket_tf.translation) {
+            let dx = screen_pos.x - cursor_pos.x;
+            let dy = screen_pos.y - cursor_pos.y;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist < best_dist {
+                clicked_rocket = true;
+                best_dist = dist;
+            }
+        }
+    }
+
+    if best_dist < CLICK_RADIUS {
+        if clicked_rocket {
+            map_focus.target = MapFocusTarget::Rocket;
+        } else if let Some(entity) = best_entity {
+            map_focus.target = MapFocusTarget::Body(entity);
+        }
     }
 }

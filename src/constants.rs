@@ -56,6 +56,13 @@ pub const NOSE_CONE_COLOR: Color = Color::srgb(0.9, 0.1, 0.1);
 pub const ENGINE_COLOR: Color = Color::srgb(0.2, 0.2, 0.2);
 pub const EXHAUST_FLAME_COLOR: Color = Color::srgb(1.0, 0.5, 0.0);
 
+// ===== Landing =====
+
+/// Vertical speed below which landing is considered "soft" (displayed in green).
+pub const LANDING_SAFE_SPEED: f32 = 5.0;
+/// If altitude above surface is less than this, consider "landed".
+pub const LANDED_ALTITUDE_THRESHOLD: f32 = 1.0;
+
 // ===== Physics =====
 
 pub const DRAG_COEFFICIENT: f32 = 0.5;

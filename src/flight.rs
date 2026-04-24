@@ -12,6 +12,17 @@ use crate::constants::*;
 pub struct FlightEntity;
 
 #[derive(Component)]
+pub struct MapIcon {
+    pub target: MapIconTarget,
+}
+
+#[derive(Clone)]
+pub enum MapIconTarget {
+    Body(Entity),
+    Rocket,
+}
+
+#[derive(Component)]
 pub struct PauseMenuUI;
 
 #[derive(Component)]
@@ -32,6 +43,7 @@ pub fn spawn_flight(
     config: Res<RocketConfig>,
     mut camera_q: Query<&mut OrbitCamera>,
     rocket_q: Query<(), With<Rocket>>,
+    planet_q: Query<(Entity, &CelestialBody)>,
 ) {
     if !rocket_q.is_empty() {
         return;
@@ -206,6 +218,46 @@ pub fn spawn_flight(
 
     // Navball
     crate::navball::spawn_navball(&mut commands, &mut images);
+
+    // Map icons (hidden by default, shown in map view)
+    // Spawned as FlightEntity so they get cleaned up
+    let icon_size = 16.0;
+    for (entity, body) in planet_q.iter() {
+        let color = match body.name.as_str() {
+            "Kerbin" => Color::srgb(0.2, 0.6, 0.9),
+            "Mun" => Color::srgb(0.6, 0.6, 0.6),
+            "Minmus" => Color::srgb(0.4, 0.8, 0.5),
+            "Sun" => Color::srgb(1.0, 0.9, 0.3),
+            _ => Color::srgb(0.7, 0.7, 0.7),
+        };
+        commands.spawn((
+            Node {
+                width: Val::Px(icon_size),
+                height: Val::Px(icon_size),
+                position_type: PositionType::Absolute,
+                ..default()
+            },
+            BackgroundColor(color.with_alpha(0.8)),
+            BorderRadius::all(Val::Percent(50.0)),
+            Visibility::Hidden,
+            MapIcon { target: MapIconTarget::Body(entity) },
+            FlightEntity,
+        ));
+    }
+    // Rocket icon
+    commands.spawn((
+        Node {
+            width: Val::Px(icon_size),
+            height: Val::Px(icon_size),
+            position_type: PositionType::Absolute,
+            ..default()
+        },
+        BackgroundColor(Color::srgb(0.0, 1.0, 0.0).with_alpha(0.8)),
+        BorderRadius::all(Val::Percent(50.0)),
+        Visibility::Hidden,
+        MapIcon { target: MapIconTarget::Rocket },
+        FlightEntity,
+    ));
 }
 
 pub fn cleanup_game(
@@ -504,10 +556,34 @@ pub fn telemetry_system(
             let r_pe = a * (1.0 - e);
             let ap_alt = r_ap - planet.radius;
             let pe_alt = r_pe - planet.radius;
-            format!("\nAp: {:.0} m\nPe: {:.0} m", ap_alt, pe_alt)
+
+            // Orbital period: T = 2π √(a³/μ)
+            let period = std::f32::consts::TAU * (a * a * a / planet.mu).sqrt();
+            let p_min = (period / 60.0).floor() as i32;
+            let p_sec = (period % 60.0).round() as i32;
+
+            // Orbital inclination: angle between orbital plane and reference plane
+            let inc = if h_mag > 0.001 {
+                let h_dir = h / h_mag;
+                h_dir.y.asin().abs().to_degrees()
+            } else { 0.0 };
+
+            format!("\nAp: {:.0} m\nPe: {:.0} m\nT: {}m {}s\nInc: {:.1}°", ap_alt, pe_alt, p_min, p_sec, inc)
         } else {
             "".to_string()
         }
+    };
+
+    // Landing detection
+    let landed_str = if altitude < LANDED_ALTITUDE_THRESHOLD && vertical_vel.abs() < 2.0 {
+        let speed_label = if vertical_vel.abs() < LANDING_SAFE_SPEED {
+            "SOFT"
+        } else {
+            "HARD"
+        };
+        format!("\n=== LANDED ({}) ===\nV-Speed: {:.1} m/s", speed_label, vertical_vel)
+    } else {
+        "".to_string()
     };
 
     let warp_str = if time_warp.rate() > 1.0 {
@@ -535,9 +611,16 @@ pub fn telemetry_system(
         SasMode::Retrograde => "SAS: Retrograde".to_string(),
     };
 
+    // Mission elapsed time
+    let t_secs = time.elapsed_secs();
+    let t_min = (t_secs / 60.0).floor() as i32;
+    let t_sec = (t_secs % 60.0).round() as i32;
+    let met_str = format!("T+ {}:{:02}", t_min, t_sec);
+
     text.0 = format!(
-        "SOI: {}\nStage: {}\nAltitude: {:.1} m\nPitch (vs Horizon): {:.1} deg\nOrbital Vel: {:.1} m/s\nSurface Vel: {:.1} m/s\nV.Speed: {:.1} m/s\nThrottle: {:.0}%{}\nThrust: {:.0} N\nFuel: {:.0} kg\nAir Density: {:.3}{}\n{}{}",
+        "SOI: {} | {}\nStage: {}\nAltitude: {:.1} m\nPitch (vs Horizon): {:.1} deg\nOrbital Vel: {:.1} m/s\nSurface Vel: {:.1} m/s\nV.Speed: {:.1} m/s\nThrottle: {:.0}%{}\nThrust: {:.0} N\nFuel: {:.0} kg\nAir Density: {:.3}{}\n{}{}{}",
         planet.name,
+        met_str,
         rocket.current_stage,
         altitude,
         pitch_deg,
@@ -551,6 +634,7 @@ pub fn telemetry_system(
         density,
         sas_str,
         ap_pe_str,
+        landed_str,
         maneuver_str,
     );
 }
@@ -675,6 +759,62 @@ pub fn map_view_toggle_system(
             AppState::MapView => next_state.set(AppState::Flight),
             _ => {}
         }
+    }
+}
+
+// ===== Map Icon Positioning =====
+
+pub fn map_icon_system(
+    state: Res<State<AppState>>,
+    camera_q: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    windows: Query<&Window>,
+    planet_q: Query<&Transform, With<CelestialBody>>,
+    rocket_q: Query<&Transform, With<Rocket>>,
+    mut icon_q: Query<(&MapIcon, &mut Node, &mut Visibility)>,
+) {
+    let is_map = *state.get() == AppState::MapView;
+    let Ok(window) = windows.get_single() else { return };
+    let Ok((camera, camera_gt)) = camera_q.get_single() else { return };
+    let win_w = window.width();
+    let win_h = window.height();
+
+    for (icon, mut node, mut vis) in icon_q.iter_mut() {
+        if !is_map {
+            *vis = Visibility::Hidden;
+            continue;
+        }
+
+        let world_pos = match &icon.target {
+            MapIconTarget::Body(entity) => {
+                match planet_q.get(*entity) {
+                    Ok(tf) => tf.translation,
+                    Err(_) => { *vis = Visibility::Hidden; continue; }
+                }
+            }
+            MapIconTarget::Rocket => {
+                match rocket_q.get_single() {
+                    Ok(tf) => tf.translation,
+                    Err(_) => { *vis = Visibility::Hidden; continue; }
+                }
+            }
+        };
+
+        let Ok(screen_pos) = camera.world_to_viewport(camera_gt, world_pos) else {
+            *vis = Visibility::Hidden;
+            continue;
+        };
+
+        // Check if on screen
+        if screen_pos.x < -50.0 || screen_pos.x > win_w + 50.0
+            || screen_pos.y < -50.0 || screen_pos.y > win_h + 50.0
+        {
+            *vis = Visibility::Hidden;
+            continue;
+        }
+
+        *vis = Visibility::Visible;
+        node.left = Val::Px(screen_pos.x - 8.0);
+        node.top = Val::Px(screen_pos.y - 8.0);
     }
 }
 
