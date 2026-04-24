@@ -4,6 +4,7 @@ use bevy::render::render_resource::{AsBindGroup, ShaderRef, RenderPipelineDescri
 use bevy::render::mesh::{VertexAttributeValues, Indices, MeshVertexBufferLayoutRef};
 use bevy::render::render_resource::SpecializedMeshPipelineError;
 
+use crate::constants::*;
 
 // ===== Noise Settings =====
 
@@ -159,6 +160,8 @@ pub struct OceanMaterial {
     pub wave_height: f32,
     #[uniform(0)]
     pub wave_frequency: f32,
+    #[uniform(0)]
+    pub sun_dir: Vec4,
 }
 
 impl Material for OceanMaterial {
@@ -180,12 +183,18 @@ pub struct OceanMarker;
 
 pub fn update_ocean_time(
     time: Res<Time>,
+    sun_q: Query<&Transform, With<crate::SunMarker>>,
     mut materials: ResMut<Assets<OceanMaterial>>,
     ocean_q: Query<&MeshMaterial3d<OceanMaterial>>,
 ) {
+    let sun_dir = sun_q.get_single()
+        .map(|tf| tf.translation.normalize_or(Vec3::X))
+        .unwrap_or(Vec3::X);
+
     for handle in ocean_q.iter() {
         if let Some(mat) = materials.get_mut(&handle.0) {
             mat.time = time.elapsed_secs();
+            mat.sun_dir = sun_dir.extend(0.0);
         }
     }
 }
@@ -211,7 +220,7 @@ pub fn update_atmosphere_camera(
 
     // Base surface for atmosphere calculations is either the solid planet or the ocean surface, whichever is higher.
     // This assumes the ocean completely covers the lowlands (offset by sea_level).
-    let surface_radius = crate::constants::KERBIN_RADIUS + terrain_config.sea_level;
+    let surface_radius = crate::constants::KERBIN_RADIUS + terrain_config.sea_level.max(0.0);
     // Make sure atmosphere radius shrinks or expands appropriately if surface_radius changes significantly
     let atmosphere_radius = surface_radius + terrain_config.atmosphere_height * 0.7;
 

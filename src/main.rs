@@ -378,8 +378,9 @@ fn setup_scene(
             color: LinearRgba::new(0.03, 0.12, 0.35, 0.85),
             time: 0.0,
             wave_speed: 1.5,
-            wave_height: 0.5, // 降低高度，配合更細密的波紋
-            wave_frequency: 2.0, // 調高頻率，讓波浪變細密
+            wave_height: 0.5,
+            wave_frequency: 2.0,
+            sun_dir: Vec4::X,
         })),
         Transform::from_xyz(0.0, 0.0, 0.0).with_rotation(kerbin_pole_rot),
         planet::OceanMarker,
@@ -1070,7 +1071,7 @@ fn terrain_debug_system(
 
     for mut tf in atmo_q.iter_mut() {
         let base_radius = constants::KERBIN_ATMOSPHERE_VISUAL_RADIUS;
-        let surface_radius = constants::KERBIN_RADIUS + config.sea_level;
+        let surface_radius = constants::KERBIN_RADIUS + config.sea_level.max(0.0);
         let target_radius = surface_radius + config.atmosphere_height * 0.7;
         let scale = target_radius / base_radius;
         tf.scale = Vec3::splat(scale);

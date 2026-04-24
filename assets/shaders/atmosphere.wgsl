@@ -51,60 +51,58 @@ fn fragment(
     let planet_hit = ray_sphere_intersect(camera_pos, view_dir, planet_radius);
 
     // Distances
-    var d_entry = max(0.0, atmo_hit.x);
+    let d_entry = max(0.0, atmo_hit.x);
     var d_exit = atmo_hit.y;
 
-    // Handle planet occlusion and camera being "underground"
-    if (planet_hit.y > 0.0) {
-        if (planet_hit.x > 0.0) {
-            // Outside looking at planet: cap at entry
-            d_exit = min(d_exit, planet_hit.x);
-        } else {
-            // Inside planet: atmosphere starts where we leave the planet
-            d_entry = max(d_entry, planet_hit.y);
-        }
+    // Handle Ocean/Planet occlusion
+    var hits_ocean = false;
+    if (planet_hit.x > 0.0) {
+        d_exit = min(d_exit, planet_hit.x);
+        hits_ocean = true;
     }
 
     let path_length = max(0.0, d_exit - d_entry);
 
     // 3. Density/Thickness model
-    // Simple linear approximation of thickness
-    // We can make this more complex later with exponential falloff
-    let max_thickness = (atmosphere_radius - planet_radius) * 2.0;
     let thickness = path_length / (atmosphere_radius - planet_radius);
 
     // 4. Sun lighting & Scattering
-    // Calculate optical depth to sun from a representative point
-    let test_point_dist = d_entry + path_length * 0.4; // Sample a bit into the atmosphere
+    // Sample light at a point along the view ray
+    let test_point_dist = d_entry + path_length * 0.5;
     let test_point = camera_pos + view_dir * test_point_dist;
     let test_dir = normalize(test_point);
 
-    // How much atmosphere is between this point and the sun?
     let sun_dir_vec3 = params.sun_dir.xyz;
     let sun_factor = dot(test_dir, sun_dir_vec3);
 
-    // Day/Night mask - much more aggressive now
-    let sun_mask = smoothstep(-0.25, 0.05, sun_factor);
+    // Day/Night mask
+    let sun_mask = smoothstep(-0.2, 0.1, sun_factor);
 
-    // Rayleigh scattering approximation:
-    // When looking at the sun through a lot of atmosphere (low sun_factor),
-    // light shifts to red/orange.
+    // Rayleigh scattering approximation
     let scatter_blue = vec3<f32>(0.2, 0.5, 1.0);
     let scatter_red = vec3<f32>(1.0, 0.4, 0.1);
-
-    // Sunset happens when sun_factor is low but positive
     let sunset_strength = smoothstep(0.4, -0.1, sun_factor);
+    var scatter_color = mix(scatter_blue, scatter_red, sunset_strength);
 
-    // Final color shifts from blue to orange/red
-    var final_color = mix(scatter_blue, scatter_red, sunset_strength);
+    // If hits ocean, we fade out the atmosphere light to prevent it from
+    // "leaking" onto the ocean floor land.
+    var ocean_fade = 1.0;
+    if (hits_ocean) {
+        // Reduce atmosphere contribution as we look closer to the planet center
+        // to let the water shader take over.
+        ocean_fade = 0.8;
+    }
 
-    // Add extra brightness for the sun disk area
+    // Final color logic
+    var final_color = scatter_color;
+
+    // Add sun disk glow
     let view_sun_dot = dot(view_dir, sun_dir_vec3);
-    let sun_glow = pow(max(0.0, view_sun_dot), 20.0) * 0.5 * sun_mask;
+    let sun_glow = pow(max(0.0, view_sun_dot), 30.0) * 0.5 * sun_mask;
     final_color += vec3<f32>(1.0, 0.9, 0.7) * sun_glow;
 
-    // Use thickness to drive alpha
-    let alpha = saturate(thickness * 0.4) * sun_mask;
+    // Use thickness to drive alpha, but ensure it doesn't over-brighten the ocean
+    let alpha = saturate(thickness * 0.5) * sun_mask * ocean_fade;
 
     return vec4<f32>(final_color, alpha * params.color.a);
 }
