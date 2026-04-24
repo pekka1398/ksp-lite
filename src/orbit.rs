@@ -3,6 +3,7 @@ use bevy::input::ButtonState;
 use bevy_rapier3d::prelude::*;
 
 use crate::{AppState, CelestialBody, Rocket, OrbitInclination, MapFocus, MapFocusTarget};
+use crate::sim::DVec3;
 use crate::constants::*;
 
 // ===== Resources =====
@@ -144,93 +145,112 @@ struct ApPe {
     periapsis: Option<Vec3>,
 }
 
+/// Computed orbital elements from a state vector relative to a central body.
+#[derive(Clone, Debug)]
+pub struct OrbitalElements {
+    pub semi_major_axis: f64,
+    pub eccentricity: f64,
+    pub eccentricity_vec: DVec3,
+    pub angular_momentum: DVec3,
+    pub specific_energy: f64,
+    pub apoapsis_radius: Option<f64>,
+    pub periapsis_radius: Option<f64>,
+    pub period: Option<f64>,
+    pub inclination_deg: f64,
+}
+
+impl OrbitalElements {
+    /// Compute orbital elements from position and velocity relative to the central body.
+    /// Returns None for degenerate orbits (zero angular momentum).
+    pub fn from_state(rel_pos: DVec3, rel_vel: DVec3, mu: f64) -> Option<Self> {
+        let h = rel_pos.cross(rel_vel);
+        let h_mag = h.length();
+        if h_mag < 0.001 {
+            return None;
+        }
+
+        let e_vec = (rel_vel.cross(h) / mu) - rel_pos.normalize();
+        let e = e_vec.length();
+        let energy = rel_vel.length_squared() / 2.0 - mu / rel_pos.length();
+
+        let a = if e < 1.0 {
+            -mu / (2.0 * energy)
+        } else {
+            mu / (2.0 * energy.abs())
+        };
+
+        let (apoapsis_radius, periapsis_radius, period) = if e > 0.001 && e < 1.0 && a > 0.0 {
+            (Some(a * (1.0 + e)), Some(a * (1.0 - e)), Some(std::f64::consts::TAU * (a * a * a / mu).sqrt()))
+        } else if e >= 1.0 {
+            (None, Some(a * (e - 1.0)), None)
+        } else if a > 0.0 {
+            // Near-circular
+            (None, None, Some(std::f64::consts::TAU * (a * a * a / mu).sqrt()))
+        } else {
+            (None, None, None)
+        };
+
+        let h_dir = h / h_mag;
+        let inclination_deg = h_dir.y.asin().abs().to_degrees();
+
+        Some(Self {
+            semi_major_axis: a,
+            eccentricity: e,
+            eccentricity_vec: e_vec,
+            angular_momentum: h,
+            specific_energy: energy,
+            apoapsis_radius,
+            periapsis_radius,
+            period,
+            inclination_deg,
+        })
+    }
+
+    /// Direction toward periapsis. Falls back to an arbitrary direction
+    /// in the orbital plane for circular orbits.
+    pub fn periapsis_direction(&self) -> DVec3 {
+        if self.eccentricity > 0.0001 {
+            self.eccentricity_vec.normalize()
+        } else {
+            let h_dir = self.angular_momentum.normalize();
+            let ref_dir = if h_dir.dot(DVec3::X).abs() < 0.9 {
+                DVec3::X
+            } else {
+                DVec3::Z
+            };
+            h_dir.cross(ref_dir).normalize()
+        }
+    }
+}
+
 fn draw_orbit_gizmo(
     gizmos: &mut Gizmos,
-    pos: Vec3,
-    vel: Vec3,
-    mu: f32,
+    elements: &OrbitalElements,
     planet_center: Vec3,
-    planet_radius: f32,
     soi_radius: f32,
     color: Color,
-    should_log: bool,
 ) -> ApPe {
-    let altitude = pos.length() - planet_radius;
-    let speed = vel.length();
-    if altitude < 10.0 || speed < 10.0 {
-        if speed > 0.0 {
-            warn!("draw_orbit_gizmo skipped: altitude={altitude:.1}, speed={speed:.1}");
-        }
-        return ApPe { apoapsis: None, periapsis: None };
-    }
+    let e = elements.eccentricity as f32;
+    let a = elements.semi_major_axis as f32;
 
-    let h = pos.cross(vel);
-    let h_mag = h.length();
-    if h_mag < 0.001 {
-        warn!("draw_orbit_gizmo skipped: h_mag={h_mag:.4} (degenerate orbit)");
-        return ApPe { apoapsis: None, periapsis: None };
-    }
-
-    let e_vec = (vel.cross(h) / mu) - pos.normalize();
-    let e = e_vec.length();
-    let energy = vel.length_squared() / 2.0 - mu / pos.length();
-
-    let a = if e < 1.0 {
-        -mu / (2.0 * energy)
-    } else {
-        mu / (2.0 * energy.abs())
-    };
-
-    if should_log {
-        debug!(
-            "orbit elements: a={:.1} e={:.6} energy={:.2} | r={:.1} v={:.1} h_mag={:.2} | mu={:.1}",
-            a, e, energy,
-            pos.length(), vel.length(), h_mag,
-            mu,
-        );
-    }
-
-    let p = if e > 0.0001 {
-        e_vec.normalize()
-    } else {
-        pos.normalize_or(Vec3::X)
-    };
-    let q = h.cross(p).normalize();
+    let p_d = elements.periapsis_direction();
+    let q_d = elements.angular_momentum.normalize().cross(p_d).normalize();
+    let p = p_d.as_vec3();
+    let q = q_d.as_vec3();
 
     let ap_pe = if e > 0.001 {
         if e < 1.0 {
-            let r_ap = a * (1.0 + e);
-            let r_pe = a * (1.0 - e);
-            if should_log {
-                debug!(
-                    "Ap/Pe: r_ap={:.1} (alt={:.1}) r_pe={:.1} (alt={:.1}) | planet_radius={:.1}",
-                    r_ap, r_ap - planet_radius,
-                    r_pe, r_pe - planet_radius,
-                    planet_radius,
-                );
-            }
             ApPe {
-                apoapsis: Some(planet_center - p * r_ap),
-                periapsis: Some(planet_center + p * r_pe),
+                apoapsis: Some(planet_center - p * (elements.apoapsis_radius.unwrap() as f32)),
+                periapsis: Some(planet_center + p * (elements.periapsis_radius.unwrap() as f32)),
             }
         } else {
-            let r_pe = a * (e - 1.0);
-            if should_log {
-                debug!(
-                    "Pe (hyperbolic): r_pe={:.1} (alt={:.1}) | planet_radius={:.1}",
-                    r_pe, r_pe - planet_radius,
-                    planet_radius,
-                );
-            }
             ApPe {
                 apoapsis: None,
-                periapsis: Some(planet_center + p * r_pe),
+                periapsis: Some(planet_center + p * (elements.periapsis_radius.unwrap() as f32)),
             }
         }
     } else {
-        if should_log {
-            debug!("No Ap/Pe: e={:.6} (circular)", e);
-        }
         ApPe { apoapsis: None, periapsis: None }
     };
 
@@ -328,9 +348,9 @@ pub fn orbit_prediction_system(
     // Relative position/velocity in SSB (f64) for orbit calculation
     let rel_pos = com_ssb_pos.0 - planet_sim.position.0;
     let rel_vel = com_ssb_vel.0 - planet_sim.velocity.0;
-    let mu = planet.mu;
+    let mu = planet.mu as f64;
 
-    // Convert to f32 for gizmo drawing and Kepler propagation
+    // Convert to f32 for Kepler propagation
     let pos_f32 = rel_pos.as_vec3();
     let vel_f32 = rel_vel.as_vec3();
     let planet_center_local = planet_sim.position.to_local(&offset);
@@ -341,13 +361,36 @@ pub fn orbit_prediction_system(
             planet.name,
             com_ssb_pos.0.x, com_ssb_pos.0.y, com_ssb_pos.0.z,
             total_mass,
-            pos_f32.x, pos_f32.y, pos_f32.z,
-            vel_f32.x, vel_f32.y, vel_f32.z,
+            rel_pos.x, rel_pos.y, rel_pos.z,
+            rel_vel.x, rel_vel.y, rel_vel.z,
             mu,
         );
     }
 
-    let ap_pe = draw_orbit_gizmo(&mut gizmos, pos_f32, vel_f32, mu, planet_center_local, planet.radius, planet.soi_radius, Color::srgb(0.0, 0.8, 1.0), should_log);
+    // Compute orbital elements (f64 precision)
+    let altitude = rel_pos.length() as f32 - planet.radius;
+    let elements = if altitude >= 10.0 {
+        OrbitalElements::from_state(rel_pos, rel_vel, mu)
+    } else {
+        None
+    };
+
+    if should_log {
+        if let Some(ref elems) = elements {
+            debug!(
+                "orbit elements: a={:.1} e={:.6} energy={:.2} | r={:.1} v={:.1} h_mag={:.2} | mu={:.1}",
+                elems.semi_major_axis, elems.eccentricity, elems.specific_energy,
+                rel_pos.length(), rel_vel.length(), elems.angular_momentum.length(),
+                mu,
+            );
+        }
+    }
+
+    let ap_pe = if let Some(ref elems) = elements {
+        draw_orbit_gizmo(&mut gizmos, elems, planet_center_local, planet.soi_radius, Color::srgb(0.0, 0.8, 1.0))
+    } else {
+        ApPe { apoapsis: None, periapsis: None }
+    };
 
     let com_local = com_ssb_pos.to_local(&offset);
     let cam_pos = camera_q.get_single().map(|t| t.translation).unwrap_or(com_local);
@@ -415,13 +458,13 @@ pub fn orbit_prediction_system(
             );
         }
         if speed > 0.1 {
-            let (future_pos, future_vel) = propagate_kepler(pos_f32, vel_f32, mu, time_to_node);
+            let (future_pos, future_vel) = propagate_kepler(pos_f32, vel_f32, planet.mu, time_to_node);
 
             let mut trail_points = vec![planet_center_local + pos_f32];
             let trail_steps = 50;
             for i in 1..=trail_steps {
                 let t = time_to_node * (i as f32 / trail_steps as f32);
-                let (rp, _) = propagate_kepler(pos_f32, vel_f32, mu, t);
+                let (rp, _) = propagate_kepler(pos_f32, vel_f32, planet.mu, t);
                 trail_points.push(planet_center_local + rp);
             }
             gizmos.linestrip(trail_points, Color::srgb(0.5, 0.5, 0.5));
@@ -455,17 +498,23 @@ pub fn orbit_prediction_system(
                             post_maneuver_vel.length(),
                         );
                     }
-                    let mnv_ap_pe = draw_orbit_gizmo(
-                        &mut gizmos,
-                        future_pos,
-                        post_maneuver_vel,
+
+                    let mnv_elements = OrbitalElements::from_state(
+                        future_pos.as_dvec3(),
+                        post_maneuver_vel.as_dvec3(),
                         mu,
-                        planet_center_local,
-                        planet.radius,
-                        planet.soi_radius,
-                        Color::srgb(1.0, 0.9, 0.0),
-                        should_log,
                     );
+                    let mnv_ap_pe = if let Some(ref mnv_elems) = mnv_elements {
+                        draw_orbit_gizmo(
+                            &mut gizmos,
+                            mnv_elems,
+                            planet_center_local,
+                            planet.soi_radius,
+                            Color::srgb(1.0, 0.9, 0.0),
+                        )
+                    } else {
+                        ApPe { apoapsis: None, periapsis: None }
+                    };
 
                     let node_world = planet_center_local + future_pos;
                     gizmos.sphere(node_world, screen_marker_radius(cam_pos, node_world), Color::srgb(1.0, 0.3, 0.0));
