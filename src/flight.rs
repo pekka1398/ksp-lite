@@ -552,38 +552,19 @@ pub fn telemetry_system(
     };
 
     let ap_pe_str = {
-        // f64 orbit element computation for precision
         let mu_d = planet.mu as f64;
-        let h_d = rel_pos_d.cross(orbital_vel_d);
-        let h_mag_d = h_d.length();
-        let e_vec_d = if h_mag_d > 0.001 {
-            (orbital_vel_d.cross(h_d) / mu_d) - rel_pos_d.normalize()
-        } else {
-            crate::sim::DVec3::ZERO
-        };
-        let e = e_vec_d.length();
-        let energy = orbital_vel_d.length_squared() / 2.0 - mu_d / rel_pos_d.length();
-        let a = if e < 1.0 && energy.abs() > 0.001 { -mu_d / (2.0 * energy) } else { 0.0 };
-        if e > 0.001 && e < 1.0 && a > 0.0 {
-            let r_ap = a * (1.0 + e);
-            let r_pe = a * (1.0 - e);
-            let ap_alt = (r_ap - planet.radius as f64) as f32;
-            let pe_alt = (r_pe - planet.radius as f64) as f32;
-
-            // Orbital period: T = 2π √(a³/μ)
-            let period = std::f64::consts::TAU * (a * a * a / mu_d).sqrt();
-            let p_min = (period / 60.0).floor() as i32;
-            let p_sec = (period % 60.0).round() as i32;
-
-            // Orbital inclination: angle between orbital plane and reference plane
-            let inc = if h_mag_d > 0.001 {
-                let h_dir = h_d / h_mag_d;
-                h_dir.y.asin().abs().to_degrees()
-            } else { 0.0 };
-
-            format!("\nAp: {:.0} m\nPe: {:.0} m\nT: {}m {}s\nInc: {:.1}°", ap_alt, pe_alt, p_min, p_sec, inc)
-        } else {
-            "".to_string()
+        match crate::orbit::OrbitalElements::from_state(rel_pos_d, orbital_vel_d, mu_d) {
+            Some(elems) if elems.eccentricity > 0.001 && elems.eccentricity < 1.0 && elems.semi_major_axis > 0.0 => {
+                let r_ap = elems.apoapsis_radius.unwrap();
+                let r_pe = elems.periapsis_radius.unwrap();
+                let ap_alt = (r_ap - planet.radius as f64) as f32;
+                let pe_alt = (r_pe - planet.radius as f64) as f32;
+                let period = elems.period.unwrap();
+                let p_min = (period / 60.0).floor() as i32;
+                let p_sec = (period % 60.0).round() as i32;
+                format!("\nAp: {:.0} m\nPe: {:.0} m\nT: {}m {}s\nInc: {:.1}°", ap_alt, pe_alt, p_min, p_sec, elems.inclination_deg)
+            }
+            _ => "".to_string()
         }
     };
 

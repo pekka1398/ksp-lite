@@ -103,8 +103,6 @@ pub const STARFIELD_COUNT: usize = 3000;
 
 // ===== Debug =====
 
-/// Altitude above Mun surface for the debug orbit spawn.
-pub const DEBUG_ORBIT_ALTITUDE: f32 = 100.0;
 
 // ===== VAB =====
 
