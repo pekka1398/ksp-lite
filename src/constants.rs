@@ -104,6 +104,22 @@ pub const STARFIELD_COUNT: usize = 3000;
 // ===== Debug =====
 
 
+// ===== Terrain =====
+
+pub const TERRAIN_MAX_HEIGHT: f32 = 180.0;
+pub const TERRAIN_SEA_LEVEL_NOISE: f32 = 0.45;
+pub const KERBIN_MESH_SEGMENTS: u32 = 512;
+pub const KERBIN_MESH_RINGS: u32 = 256;
+
+// ===== Atmosphere Visual =====
+
+pub const KERBIN_ATMOSPHERE_VISUAL_RADIUS: f32 = KERBIN_RADIUS + KERBIN_ATMOSPHERE_HEIGHT * 0.7;
+pub const ATMOSPHERE_RIM_POWER: f32 = 3.0;
+
+// ===== Ocean =====
+
+pub const OCEAN_RADIUS: f32 = KERBIN_RADIUS + 0.1;
+
 // ===== VAB =====
 
 /// VAB preview / camera target: just above the launch pad on the equator (+X).

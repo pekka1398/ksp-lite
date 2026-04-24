@@ -6,6 +6,7 @@ use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::core_pipeline::Skybox;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy_rapier3d::prelude::*;
+use bevy_egui::{egui, EguiContexts, EguiPlugin};
 
 mod vab;
 mod flight;
@@ -14,6 +15,7 @@ mod constants;
 mod starfield;
 mod navball;
 mod sim;
+mod planet;
 
 use vab::RocketConfig;
 use flight::PrePauseView;
@@ -74,6 +76,55 @@ impl Default for TimeWarp {
 impl TimeWarp {
     pub fn rate(&self) -> f32 {
         self.rates[self.index]
+    }
+}
+
+#[derive(Resource)]
+pub struct TerrainConfig {
+    pub max_height_ratio: f32, // 山高佔半徑的比例
+    pub sea_level: f32,
+    pub ocean_depth_multiplier: f32,
+    pub ocean_floor_smoothing: f32,
+    pub mountain_blend: f32,
+    pub continent: planet::NoiseSettings,
+    pub mountain: planet::NoiseSettings,
+    pub mask: planet::NoiseSettings,
+}
+
+impl Default for TerrainConfig {
+    fn default() -> Self {
+        Self {
+            max_height_ratio: 0.09, // 180 / 2000
+            sea_level: constants::TERRAIN_SEA_LEVEL_NOISE,
+            ocean_depth_multiplier: 1.0,
+            ocean_floor_smoothing: 0.2,
+            mountain_blend: 1.0,
+            continent: planet::NoiseSettings {
+                octaves: 6,
+                frequency: 0.8,
+                persistence: 0.5,
+                lacunarity: 2.0,
+                strength: 0.7,
+                ..default()
+            },
+            mountain: planet::NoiseSettings {
+                octaves: 7,
+                frequency: 3.5,
+                persistence: 0.45,
+                lacunarity: 2.1,
+                exponent: 2.5,
+                strength: 1.2,
+                ..default()
+            },
+            mask: planet::NoiseSettings {
+                octaves: 3,
+                frequency: 1.2,
+                persistence: 0.5,
+                lacunarity: 2.0,
+                strength: 1.0,
+                ..default()
+            },
+        }
     }
 }
 
@@ -191,8 +242,11 @@ fn auto_flight_startup(
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
+        .add_plugins(EguiPlugin)
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
         .add_plugins(RapierDebugRenderPlugin::default())
+        .add_plugins(MaterialPlugin::<planet::AtmosphereMaterial>::default())
+        .add_plugins(MaterialPlugin::<planet::OceanMaterial>::default())
         .insert_resource(TimestepMode::Interpolated {
             dt: 1.0 / 60.0, // physics timestep
             time_scale: 1.0,
@@ -200,6 +254,7 @@ fn main() {
         })
         .init_state::<AppState>()
         .init_resource::<TimeWarp>()
+        .init_resource::<TerrainConfig>()
         .init_resource::<ManeuverNode>()
         .init_resource::<PrePauseView>()
         .init_resource::<RocketConfig>()
@@ -237,6 +292,9 @@ fn main() {
                 flight::debug_orbit_apply_system,
                 flight::map_icon_system,
                 navball::navball_system,
+                planet::update_atmosphere_camera,
+                planet::update_ocean_time,
+                terrain_debug_system,
             ),
         )
         .add_systems(
@@ -266,14 +324,32 @@ fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut atmosphere_materials: ResMut<Assets<planet::AtmosphereMaterial>>,
+    mut ocean_materials: ResMut<Assets<planet::OceanMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
     let kerbin_mu = constants::KERBIN_SURFACE_GRAVITY * constants::KERBIN_RADIUS * constants::KERBIN_RADIUS;
 
     // Rotate mesh so Bevy's UV sphere +Z pole aligns with world +Y (our north)
     let kerbin_pole_rot = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+
+    // Terrain mesh with displaced vertices
+    let default_config = TerrainConfig::default();
+    let kerbin_mesh = planet::generate_terrain_sphere_mesh(
+        constants::KERBIN_RADIUS,
+        constants::KERBIN_MESH_SEGMENTS,
+        constants::KERBIN_MESH_RINGS,
+        default_config.max_height_ratio,
+        default_config.ocean_depth_multiplier,
+        default_config.ocean_floor_smoothing,
+        default_config.mountain_blend,
+        &default_config.continent,
+        &default_config.mountain,
+        &default_config.mask,
+    );
+
     let kerbin_entity = commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(constants::KERBIN_RADIUS).mesh().uv(32, 18))),
+        Mesh3d(meshes.add(kerbin_mesh)),
         MeshMaterial3d(materials.add(generate_kerbin_material(&mut images))),
         Transform::from_xyz(0.0, 0.0, 0.0).with_rotation(kerbin_pole_rot),
         Collider::ball(constants::KERBIN_RADIUS),
@@ -292,6 +368,31 @@ fn setup_scene(
         position: sim::SsbPosition(sim::DVec3::ZERO),
         velocity: sim::SsbVelocity(sim::DVec3::ZERO),
     }).id();
+
+    // Ocean — wavy blue sphere with custom shader
+    commands.spawn((
+        Mesh3d(meshes.add(Sphere::new(constants::OCEAN_RADIUS).mesh().uv(128, 64))),
+        MeshMaterial3d(ocean_materials.add(planet::OceanMaterial {
+            color: LinearRgba::new(0.03, 0.12, 0.35, 0.85),
+            time: 0.0,
+            wave_speed: 1.5,
+            wave_height: 0.5, // 降低高度，配合更細密的波紋
+            wave_frequency: 2.0, // 調高頻率，讓波浪變細密
+        })),
+        Transform::from_xyz(0.0, 0.0, 0.0).with_rotation(kerbin_pole_rot),
+        planet::OceanMarker,
+    ));
+
+    // Atmosphere — Fresnel rim glow sphere
+    commands.spawn((
+        Mesh3d(meshes.add(Sphere::new(constants::KERBIN_ATMOSPHERE_VISUAL_RADIUS).mesh().uv(32, 16))),
+        MeshMaterial3d(atmosphere_materials.add(planet::AtmosphereMaterial {
+            color: LinearRgba::new(0.3, 0.6, 1.0, 0.6),
+            camera_and_rim: Vec4::new(0.0, 0.0, 0.0, constants::ATMOSPHERE_RIM_POWER),
+        })),
+        Transform::from_xyz(0.0, 0.0, 0.0).with_rotation(kerbin_pole_rot),
+        planet::AtmosphereMarker,
+    ));
 
     let mun_mu = constants::MUN_SURFACE_GRAVITY * constants::MUN_RADIUS * constants::MUN_RADIUS;
     let mun_orbital_speed = f32::sqrt(kerbin_mu / constants::MUN_ORBIT_RADIUS);
@@ -453,7 +554,10 @@ fn generate_kerbin_material(images: &mut Assets<Image>) -> StandardMaterial {
             let lat = dir.z.asin();
 
             // Multi-octave value noise on 3D position
-            let n = fbm(dir * 2.5, 5);
+            let n = planet::fbm(dir * 2.5, &planet::NoiseSettings {
+                octaves: 5,
+                ..default()
+            });
 
             // Polar ice
             let polar = (lat.abs() - 1.1).max(0.0) * 5.0;
@@ -514,14 +618,14 @@ fn generate_mun_material(images: &mut Assets<Image>) -> StandardMaterial {
     // Pre-generate crater centers using hash-based positions
     // Each crater: (direction on unit sphere, radius)
     let crater_seeds: Vec<(Vec3, f32)> = (0..80).map(|i| {
-        let theta = hash3(i * 7, i * 13, i * 3) * std::f32::consts::TAU;
-        let phi = (hash3(i * 11, i * 17, i * 5) * 2.0 - 1.0).asin();
+        let theta = planet::hash3(i * 7, i * 13, i * 3) * std::f32::consts::TAU;
+        let phi = (planet::hash3(i * 11, i * 17, i * 5) * 2.0 - 1.0).asin();
         let dir = Vec3::new(
             phi.cos() * theta.cos(),
             phi.cos() * theta.sin(),
             phi.sin(),
         );
-        let radius = 0.05 + hash3(i * 19, i * 23, i * 29) * 0.2;
+        let radius = 0.05 + planet::hash3(i * 19, i * 23, i * 29) * 0.2;
         (dir, radius)
     }).collect();
 
@@ -539,7 +643,10 @@ fn generate_mun_material(images: &mut Assets<Image>) -> StandardMaterial {
             );
 
             // Base surface: subtle noise variation
-            let base = 0.45 + fbm(dir * 4.0, 4) * 0.15;
+            let base = 0.45 + planet::fbm(dir * 4.0, &planet::NoiseSettings {
+                octaves: 4,
+                ..default()
+            }) * 0.15;
 
             // Crater contribution
             let mut crater_val = 0.0;
@@ -586,59 +693,6 @@ fn generate_mun_material(images: &mut Assets<Image>) -> StandardMaterial {
         perceptual_roughness: 0.95,
         ..default()
     }
-}
-
-/// Simple hash-based value noise on 3D integer grid.
-fn hash3(x: i32, y: i32, z: i32) -> f32 {
-    let mut h = (x as u32).wrapping_mul(374761393)
-        .wrapping_add((y as u32).wrapping_mul(668265263))
-        .wrapping_add((z as u32).wrapping_mul(1274126177));
-    h = (h ^ (h >> 13)).wrapping_mul(1274126177);
-    h = (h ^ (h >> 16)).wrapping_mul(668265263);
-    h as f32 / u32::MAX as f32
-}
-
-/// Smooth value noise with trilinear interpolation.
-fn vnoise(p: Vec3) -> f32 {
-    let ix = p.x.floor() as i32;
-    let iy = p.y.floor() as i32;
-    let iz = p.z.floor() as i32;
-    let fx = p.x - ix as f32;
-    let fy = p.y - iy as f32;
-    let fz = p.z - iz as f32;
-    // Smoothstep
-    let sx = fx * fx * (3.0 - 2.0 * fx);
-    let sy = fy * fy * (3.0 - 2.0 * fy);
-    let sz = fz * fz * (3.0 - 2.0 * fz);
-
-    let mut acc = 0.0;
-    for dz in 0..=1i32 {
-        for dy in 0..=1i32 {
-            for dx in 0..=1i32 {
-                let v = hash3(ix + dx, iy + dy, iz + dz);
-                let wx = if dx == 0 { 1.0 - sx } else { sx };
-                let wy = if dy == 0 { 1.0 - sy } else { sy };
-                let wz = if dz == 0 { 1.0 - sz } else { sz };
-                acc += v * wx * wy * wz;
-            }
-        }
-    }
-    acc
-}
-
-/// Fractal Brownian Motion — layered noise.
-fn fbm(p: Vec3, octaves: u32) -> f32 {
-    let mut val = 0.0;
-    let mut amp = 0.5;
-    let mut freq = 1.0;
-    let mut pos = p;
-    for _ in 0..octaves {
-        val += amp * vnoise(pos * freq);
-        freq *= 2.0;
-        amp *= 0.5;
-        pos = Vec3::new(pos.z * 1.1, pos.x * 0.9, pos.y * 1.05);
-    }
-    val
 }
 
 // ===== Main Menu =====
@@ -931,5 +985,80 @@ fn sun_light_system(
     for mut light_tf in light_q.iter_mut() {
         light_tf.translation = sun_tf.translation;
         light_tf.look_at(Vec3::ZERO, Vec3::Y);
+    }
+}
+
+fn terrain_debug_system(
+    mut contexts: EguiContexts,
+    mut config: ResMut<TerrainConfig>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    planet_q: Query<&Mesh3d, With<CelestialBody>>,
+    mut ocean_q: Query<&mut Transform, (With<planet::OceanMarker>, Without<CelestialBody>)>,
+) {
+    let mut changed = false;
+
+    egui::Window::new("Terrain Editor").show(contexts.ctx_mut(), |ui| {
+        ui.heading("Global & Ocean Mask");
+        if ui.add(egui::Slider::new(&mut config.max_height_ratio, 0.0..=0.3).text("Max Height Ratio")).changed() { changed = true; }
+        if ui.add(egui::Slider::new(&mut config.sea_level, -500.0..=500.0).text("Sea Level Offset")).changed() { changed = true; }
+        if ui.add(egui::Slider::new(&mut config.ocean_depth_multiplier, 0.0..=10.0).text("Ocean Depth Multiplier")).changed() { changed = true; }
+        if ui.add(egui::Slider::new(&mut config.ocean_floor_smoothing, 0.001..=1.0).text("Ocean Floor Smoothing")).changed() { changed = true; }
+        if ui.add(egui::Slider::new(&mut config.mountain_blend, 0.0..=2.0).text("Mountain Blend Weight")).changed() { changed = true; }
+
+        fn edit_noise(ui: &mut egui::Ui, label: &str, settings: &mut planet::NoiseSettings) -> bool {
+            let mut c = false;
+            ui.collapsing(label, |ui| {
+                if ui.add(egui::Slider::new(&mut settings.octaves, 1..=10).text("Octaves")).changed() { c = true; }
+                if ui.add(egui::Slider::new(&mut settings.frequency, 0.01..=10.0).text("Frequency")).changed() { c = true; }
+                if ui.add(egui::Slider::new(&mut settings.persistence, 0.0..=1.0).text("Persistence")).changed() { c = true; }
+                if ui.add(egui::Slider::new(&mut settings.lacunarity, 1.0..=4.0).text("Lacunarity")).changed() { c = true; }
+                if ui.add(egui::Slider::new(&mut settings.exponent, 0.1..=5.0).text("Exponent/Sharpness")).changed() { c = true; }
+                if ui.add(egui::Slider::new(&mut settings.strength, 0.0..=2.0).text("Strength")).changed() { c = true; }
+            });
+            c
+        }
+
+        ui.separator();
+        if edit_noise(ui, "Continent Noise", &mut config.continent) { changed = true; }
+        if edit_noise(ui, "Mountain Noise (Ridged)", &mut config.mountain) { changed = true; }
+        if edit_noise(ui, "Mountain Mask", &mut config.mask) { changed = true; }
+
+        if ui.button("Randomize Seeds").clicked() {
+            use rand::RngExt;
+            let mut rng = rand::rng();
+            config.continent.offset = Vec3::new(rng.random_range(0.0..1000.0), rng.random_range(0.0..1000.0), rng.random_range(0.0..1000.0));
+            config.mountain.offset = Vec3::new(rng.random_range(0.0..1000.0), rng.random_range(0.0..1000.0), rng.random_range(0.0..1000.0));
+            config.mask.offset = Vec3::new(rng.random_range(0.0..1000.0), rng.random_range(0.0..1000.0), rng.random_range(0.0..1000.0));
+            changed = true;
+        }
+    });
+
+    if changed {
+        // 更新地形網格
+        let new_mesh = planet::generate_terrain_sphere_mesh(
+            constants::KERBIN_RADIUS,
+            constants::KERBIN_MESH_SEGMENTS,
+            constants::KERBIN_MESH_RINGS,
+            config.max_height_ratio,
+            config.ocean_depth_multiplier,
+            config.ocean_floor_smoothing,
+            config.mountain_blend,
+            &config.continent,
+            &config.mountain,
+            &config.mask,
+        );
+        for mesh_handle in planet_q.iter() {
+            if let Some(mesh) = meshes.get_mut(&mesh_handle.0) {
+                *mesh = new_mesh.clone();
+            }
+        }
+    }
+
+    // 實時更新海洋半徑
+    for mut tf in ocean_q.iter_mut() {
+        let base_radius = constants::OCEAN_RADIUS;
+        let target_radius = constants::KERBIN_RADIUS + config.sea_level;
+        let scale = target_radius / base_radius;
+        tf.scale = Vec3::splat(scale);
     }
 }
