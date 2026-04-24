@@ -90,34 +90,36 @@ pub fn propagate_kepler(pos: Vec3, vel: Vec3, mu: f32, dt: f32) -> (Vec3, Vec3) 
     (r, v)
 }
 
-/// Find the dominant SOI body for a given world position.
+/// Find the dominant SOI body for a given SSB position.
+/// Returns the body and its SimState (source of truth for position & velocity).
 pub fn find_soi_body<'a>(
-    pos: Vec3,
-    bodies: impl Iterator<Item = (&'a CelestialBody, &'a Transform)>,
+    pos: crate::sim::SsbPosition,
+    bodies: impl Iterator<Item = (&'a CelestialBody, &'a crate::sim::SimState)>,
     should_log: bool,
-) -> (&'a CelestialBody, &'a Transform) {
-    let mut soi: Option<(&CelestialBody, &Transform)> = None;
-    let mut soi_ratio = f32::MAX;
-    let mut nearest: Option<(&CelestialBody, &Transform)> = None;
-    let mut nearest_dist = f32::MAX;
+) -> (&'a CelestialBody, &'a crate::sim::SimState) {
+    let mut soi: Option<(&CelestialBody, &crate::sim::SimState)> = None;
+    let mut soi_ratio = f64::MAX;
+    let mut nearest: Option<(&CelestialBody, &crate::sim::SimState)> = None;
+    let mut nearest_dist = f64::MAX;
 
-    for (body, body_tf) in bodies {
-        let dist = (pos - body_tf.translation).length();
+    for (body, body_sim) in bodies {
+        let dist = (pos.0 - body_sim.position.0).length();
         if should_log {
             debug!(
                 "SOI candidate: {} | dist={:.1} | soi_radius={:.1} | inside={}",
-                body.name, dist, body.soi_radius, dist < body.soi_radius,
+                body.name, dist, body.soi_radius, dist < body.soi_radius as f64,
             );
         }
         if dist < nearest_dist {
             nearest_dist = dist;
-            nearest = Some((body, body_tf));
+            nearest = Some((body, body_sim));
         }
-        if dist < body.soi_radius {
-            let ratio = dist / body.soi_radius;
+        let soi_r = body.soi_radius as f64;
+        if dist < soi_r {
+            let ratio = dist / soi_r;
             if ratio < soi_ratio {
                 soi_ratio = ratio;
-                soi = Some((body, body_tf));
+                soi = Some((body, body_sim));
             }
         }
     }
@@ -133,21 +135,6 @@ pub fn find_soi_body<'a>(
         );
     }
     result
-}
-
-/// Compute the world-space velocity of a celestial body (orbital motion).
-pub fn soi_body_velocity(body: &CelestialBody, body_tf: &Transform) -> Vec3 {
-    if body.orbit_radius > 0.0 && body.orbit_speed > 0.0 {
-        body.orbit_speed * Vec3::new(-body_tf.translation.z, 0.0, body_tf.translation.x)
-    } else {
-        Vec3::ZERO
-    }
-}
-
-/// Compute the surface rotation velocity at a world position on a rotating body.
-pub fn surface_rotation_velocity(body: &CelestialBody, pos: Vec3) -> Vec3 {
-    if body.rotation_speed == 0.0 { return Vec3::ZERO; }
-    body.rotation_speed * Vec3::new(-pos.z, 0.0, pos.x)
 }
 
 // ===== Orbit Drawing =====
@@ -292,9 +279,10 @@ fn screen_marker_radius(cam_pos: Vec3, marker_pos: Vec3) -> f32 {
 
 pub fn orbit_prediction_system(
     mut gizmos: Gizmos,
-    planet_q: Query<(&CelestialBody, &Transform, Option<&OrbitInclination>)>,
-    rocket_q: Query<(&Transform, &Velocity, &ColliderMassProperties, Entity), With<Rocket>>,
-    part_q: Query<(Entity, &Transform, &ColliderMassProperties, &Velocity), Without<Rocket>>,
+    offset: Res<crate::sim::LocalOffset>,
+    planet_q: Query<(&CelestialBody, &crate::sim::SimState, Option<&OrbitInclination>)>,
+    rocket_q: Query<(&crate::sim::SimState, &ColliderMassProperties, Entity), With<Rocket>>,
+    part_q: Query<(Entity, &crate::sim::SimState, &ColliderMassProperties), Without<Rocket>>,
     joint_q: Query<&ImpulseJoint>,
     camera_q: Query<&Transform, With<Camera3d>>,
     state: Res<State<AppState>>,
@@ -311,53 +299,60 @@ pub fn orbit_prediction_system(
 
     let now = time.elapsed_secs_f64();
 
-    let Ok((rocket_tf, rocket_vel, rocket_mass_props, rocket_entity)) = rocket_q.get_single() else { return; };
+    let Ok((rocket_sim, rocket_mass_props, rocket_entity)) = rocket_q.get_single() else { return; };
 
     let mut total_mass = 0.0;
-    let mut weighted_pos = Vec3::ZERO;
-    let mut weighted_vel = Vec3::ZERO;
+    let mut weighted_pos = crate::sim::DVec3::ZERO;
+    let mut weighted_vel = crate::sim::DVec3::ZERO;
 
     let m0 = if let ColliderMassProperties::Mass(m) = *rocket_mass_props { m } else { 1.0 };
     total_mass += m0;
-    weighted_pos += rocket_tf.translation * m0;
-    weighted_vel += rocket_vel.linvel * m0;
+    weighted_pos += rocket_sim.position.0 * m0 as f64;
+    weighted_vel += rocket_sim.velocity.0 * m0 as f64;
 
-    for (part_entity, part_tf, part_mass_props, part_vel) in part_q.iter() {
+    for (part_entity, part_sim, part_mass_props) in part_q.iter() {
         let is_attached = joint_q.iter().any(|j| j.parent == rocket_entity && part_entity != rocket_entity);
         if is_attached {
             let m = if let ColliderMassProperties::Mass(m) = *part_mass_props { m } else { 1.0 };
             total_mass += m;
-            weighted_pos += part_tf.translation * m;
-            weighted_vel += part_vel.linvel * m;
+            weighted_pos += part_sim.position.0 * m as f64;
+            weighted_vel += part_sim.velocity.0 * m as f64;
         }
     }
 
-    let com_pos = weighted_pos / total_mass;
-    let com_vel = weighted_vel / total_mass;
+    let com_ssb_pos = crate::sim::SsbPosition(weighted_pos / total_mass as f64);
+    let com_ssb_vel = crate::sim::SsbVelocity(weighted_vel / total_mass as f64);
 
-    let (planet, planet_tf) = find_soi_body(com_pos, planet_q.iter().map(|(b, t, _)| (b, t)), should_log);
+    let (planet, planet_sim) = find_soi_body(com_ssb_pos, planet_q.iter().map(|(b, s, _)| (b, s)), should_log);
 
-    let pos = com_pos - planet_tf.translation;
-    let vel = com_vel - soi_body_velocity(planet, planet_tf);
+    // Relative position/velocity in SSB (f64) for orbit calculation
+    let rel_pos = com_ssb_pos.0 - planet_sim.position.0;
+    let rel_vel = com_ssb_vel.0 - planet_sim.velocity.0;
     let mu = planet.mu;
+
+    // Convert to f32 for gizmo drawing and Kepler propagation
+    let pos_f32 = rel_pos.as_vec3();
+    let vel_f32 = rel_vel.as_vec3();
+    let planet_center_local = planet_sim.position.to_local(&offset);
 
     if should_log {
         debug!(
             "orbit_prediction: SOI={} | com=({:.1},{:.1},{:.1}) total_mass={:.1} | rel_pos=({:.1},{:.1},{:.1}) rel_vel=({:.1},{:.1},{:.1}) | mu={:.1}",
             planet.name,
-            com_pos.x, com_pos.y, com_pos.z,
+            com_ssb_pos.0.x, com_ssb_pos.0.y, com_ssb_pos.0.z,
             total_mass,
-            pos.x, pos.y, pos.z,
-            vel.x, vel.y, vel.z,
+            pos_f32.x, pos_f32.y, pos_f32.z,
+            vel_f32.x, vel_f32.y, vel_f32.z,
             mu,
         );
     }
 
-    let ap_pe = draw_orbit_gizmo(&mut gizmos, pos, vel, mu, planet_tf.translation, planet.radius, planet.soi_radius, Color::srgb(0.0, 0.8, 1.0), should_log);
+    let ap_pe = draw_orbit_gizmo(&mut gizmos, pos_f32, vel_f32, mu, planet_center_local, planet.radius, planet.soi_radius, Color::srgb(0.0, 0.8, 1.0), should_log);
 
-    let cam_pos = camera_q.get_single().map(|t| t.translation).unwrap_or(com_pos);
+    let com_local = com_ssb_pos.to_local(&offset);
+    let cam_pos = camera_q.get_single().map(|t| t.translation).unwrap_or(com_local);
 
-    gizmos.sphere(com_pos, screen_marker_radius(cam_pos, com_pos), Color::srgb(0.0, 1.0, 0.0));
+    gizmos.sphere(com_local, screen_marker_radius(cam_pos, com_local), Color::srgb(0.0, 1.0, 0.0));
 
     if let Some(ap_pos) = ap_pe.apoapsis {
         gizmos.sphere(ap_pos, screen_marker_radius(cam_pos, ap_pos), Color::srgb(1.0, 0.3, 0.3));
@@ -367,30 +362,36 @@ pub fn orbit_prediction_system(
     }
 
     // Draw orbital paths for celestial bodies that orbit another body
-    for (body, _tf, inclination) in planet_q.iter() {
+    for (body, _body_sim, inclination) in planet_q.iter() {
         if body.orbit_radius > 0.0 {
             // Find parent position — the body this one orbits
             let parent_pos = planet_q.iter()
                 .find(|(b, _, _)| b.orbit_radius == 0.0 && b.name != body.name)
-                .map(|(_, tf, _)| tf.translation)
-                .unwrap_or(Vec3::ZERO);
+                .map(|(_, s, _)| s.position.0)
+                .unwrap_or(crate::sim::DVec3::ZERO);
 
             let inc = inclination.map(|i| i.0).unwrap_or(0.0);
             let segments = 128;
             let mut points = Vec::with_capacity(segments + 1);
             for i in 0..=segments {
                 let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
-                let plane_pos = Vec3::new(
-                    body.orbit_radius * angle.cos(),
+                let plane_pos = crate::sim::DVec3::new(
+                    body.orbit_radius as f64 * angle as f64,
                     0.0,
-                    body.orbit_radius * angle.sin(),
+                    body.orbit_radius as f64 * (angle as f64).sin(),
                 );
+                let x = plane_pos.x;
+                let z = plane_pos.z;
                 let rotated = if inc != 0.0 {
-                    Quat::from_rotation_x(inc) * plane_pos
+                    let ci = inc.cos() as f64;
+                    let si = inc.sin() as f64;
+                    crate::sim::DVec3::new(x, z * si, z * ci)
                 } else {
                     plane_pos
                 };
-                points.push(parent_pos + rotated);
+                let world_ssb = parent_pos + rotated;
+                let world_local = (world_ssb - offset.0).as_vec3();
+                points.push(world_local);
             }
             gizmos.linestrip(points, Color::srgba(0.4, 0.4, 0.4, 0.5));
         }
@@ -404,7 +405,7 @@ pub fn orbit_prediction_system(
         *maneuver = ManeuverNode::default();
     }
     if maneuver.is_active() {
-        let speed = vel.length();
+        let speed = vel_f32.length();
         if should_log {
             debug!(
                 "maneuver: active=true | time_to_node={:.1}s | prograde={:.1} normal={:.1} radial={:.1} | current_speed={:.1}",
@@ -414,14 +415,14 @@ pub fn orbit_prediction_system(
             );
         }
         if speed > 0.1 {
-            let (future_pos, future_vel) = propagate_kepler(pos, vel, mu, time_to_node);
+            let (future_pos, future_vel) = propagate_kepler(pos_f32, vel_f32, mu, time_to_node);
 
-            let mut trail_points = vec![planet_tf.translation + pos];
+            let mut trail_points = vec![planet_center_local + pos_f32];
             let trail_steps = 50;
             for i in 1..=trail_steps {
                 let t = time_to_node * (i as f32 / trail_steps as f32);
-                let (rp, _) = propagate_kepler(pos, vel, mu, t);
-                trail_points.push(planet_tf.translation + rp);
+                let (rp, _) = propagate_kepler(pos_f32, vel_f32, mu, t);
+                trail_points.push(planet_center_local + rp);
             }
             gizmos.linestrip(trail_points, Color::srgb(0.5, 0.5, 0.5));
 
@@ -459,14 +460,14 @@ pub fn orbit_prediction_system(
                         future_pos,
                         post_maneuver_vel,
                         mu,
-                        planet_tf.translation,
+                        planet_center_local,
                         planet.radius,
                         planet.soi_radius,
                         Color::srgb(1.0, 0.9, 0.0),
                         should_log,
                     );
 
-                    let node_world = planet_tf.translation + future_pos;
+                    let node_world = planet_center_local + future_pos;
                     gizmos.sphere(node_world, screen_marker_radius(cam_pos, node_world), Color::srgb(1.0, 0.3, 0.0));
 
                     if let Some(ap_pos) = mnv_ap_pe.apoapsis {

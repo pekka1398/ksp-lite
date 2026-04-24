@@ -1,6 +1,5 @@
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy_rapier3d::prelude::Velocity;
 use crate::{AppState, Rocket, CelestialBody};
 use crate::flight::FlightEntity;
 use crate::orbit;
@@ -60,15 +59,15 @@ pub fn spawn_navball(commands: &mut Commands, images: &mut Assets<Image>) {
 }
 
 pub fn navball_system(
-    rocket_q: Query<(&Transform, &Velocity), With<Rocket>>,
-    planet_q: Query<(&CelestialBody, &Transform), Without<Rocket>>,
+    rocket_q: Query<(&Transform, &crate::sim::SimState), With<Rocket>>,
+    planet_q: Query<(&CelestialBody, &crate::sim::SimState), Without<Rocket>>,
     mut images: ResMut<Assets<Image>>,
     navball_q: Query<&ImageNode, With<Navball>>,
     state: Res<State<AppState>>,
 ) {
     if *state.get() != AppState::Flight && *state.get() != AppState::MapView { return; }
 
-    let Ok((rocket_tf, rocket_vel)) = rocket_q.get_single() else { return };
+    let Ok((rocket_tf, rocket_sim)) = rocket_q.get_single() else { return };
     let Ok(image_node) = navball_q.get_single() else { return };
 
     let handle = image_node.image.clone();
@@ -83,12 +82,11 @@ pub fn navball_system(
     let ship_up = ship_fwd.cross(ship_right);
 
     // Orbital reference frame
-    let (soi_body, soi_tf) = orbit::find_soi_body(rocket_tf.translation, planet_q.iter(), false);
-    let soi_vel = orbit::soi_body_velocity(soi_body, soi_tf);
-    let rel_pos = rocket_tf.translation - soi_tf.translation;
-    let orbital_vel = rocket_vel.linvel
-        + orbit::surface_rotation_velocity(soi_body, rel_pos)
-        - soi_vel;
+    let (_soi_body, soi_sim) = orbit::find_soi_body(rocket_sim.position, planet_q.iter(), false);
+    let rel_pos_d = rocket_sim.position.0 - soi_sim.position.0;
+    let orbital_vel_d = rocket_sim.velocity.0 - soi_sim.velocity.0;
+    let orbital_vel = orbital_vel_d.as_vec3();
+    let rel_pos = rel_pos_d.as_vec3();
 
     let radial_out = rel_pos.normalize_or(Vec3::Y);
     let prograde = if orbital_vel.length() > 1.0 {

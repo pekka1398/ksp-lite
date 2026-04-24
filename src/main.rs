@@ -13,6 +13,7 @@ mod orbit;
 mod constants;
 mod starfield;
 mod navball;
+mod sim;
 
 use vab::RocketConfig;
 use flight::PrePauseView;
@@ -43,7 +44,15 @@ enum MenuButton {
 }
 
 #[derive(Resource)]
-pub struct DebugLaunched;
+pub struct DebugLaunched(pub DebugOrbitPreset);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum DebugOrbitPreset {
+    #[default]
+    KerbinElliptical1,
+    KerbinElliptical2,
+    KerbinElliptical3,
+}
 
 // ===== Shared Resources =====
 
@@ -128,20 +137,6 @@ pub struct ExhaustFlame(pub usize);
 pub struct FloatingOrigin;
 
 #[derive(Resource, Default)]
-pub struct FloatingOriginOffset(pub Vec3);
-
-#[derive(Resource)]
-pub struct FloatingOriginSettings {
-    pub threshold: f32,
-}
-
-impl Default for FloatingOriginSettings {
-    fn default() -> Self {
-        Self { threshold: constants::FLOATING_ORIGIN_THRESHOLD }
-    }
-}
-
-#[derive(Resource, Default)]
 pub struct MapFocus {
     /// What to focus on in map view. None = focus on rocket's SOI body.
     pub target: MapFocusTarget,
@@ -172,6 +167,27 @@ struct SunMarker;
 
 // ===== Main =====
 
+/// If `--orbit` is passed, skip main menu and go straight to debug orbit flight.
+/// `--orbit=1/2/3` selects different elliptical orbit presets.
+fn auto_flight_startup(
+    mut next_state: ResMut<NextState<AppState>>,
+    mut commands: Commands,
+) {
+    let args: Vec<String> = std::env::args().collect();
+    let orbit_arg = args.iter().find(|a| a.starts_with("--orbit"));
+    if let Some(arg) = orbit_arg {
+        let preset = if arg.contains("=2") {
+            DebugOrbitPreset::KerbinElliptical2
+        } else if arg.contains("=3") {
+            DebugOrbitPreset::KerbinElliptical3
+        } else {
+            DebugOrbitPreset::KerbinElliptical1
+        };
+        commands.insert_resource(DebugLaunched(preset));
+        next_state.set(AppState::Flight);
+    }
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
@@ -187,10 +203,9 @@ fn main() {
         .init_resource::<ManeuverNode>()
         .init_resource::<PrePauseView>()
         .init_resource::<RocketConfig>()
-        .init_resource::<FloatingOriginOffset>()
-        .init_resource::<FloatingOriginSettings>()
+        .init_resource::<sim::LocalOffset>()
         .init_resource::<MapFocus>()
-        .add_systems(Startup, setup_scene)
+        .add_systems(Startup, (setup_scene, auto_flight_startup))
         // State transitions — cleanup before spawn so floating origin resets first
         .add_systems(OnEnter(AppState::MainMenu), flight::cleanup_game)
         .add_systems(OnEnter(AppState::MainMenu), spawn_main_menu)
@@ -199,6 +214,7 @@ fn main() {
         .add_systems(OnEnter(AppState::VAB), vab::spawn_vab)
         .add_systems(OnExit(AppState::VAB), vab::despawn_vab)
         .add_systems(OnEnter(AppState::Flight), flight::spawn_flight)
+        .add_systems(OnEnter(AppState::MapView), flight::enter_map_view_system)
         // Update systems
         .add_systems(
             Update,
@@ -206,8 +222,12 @@ fn main() {
                 main_menu_button_system.run_if(in_state(AppState::MainMenu)),
                 vab::vab_button_system.run_if(in_state(AppState::VAB)),
                 flight::celestial_orbit_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
-                flight::rocket_flight_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
-                flight::telemetry_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
+                flight::rocket_flight_system
+                    .run_if(in_state(AppState::Flight).or(in_state(AppState::MapView)))
+                    .after(flight::celestial_orbit_system),
+                flight::telemetry_system
+                    .run_if(in_state(AppState::Flight).or(in_state(AppState::MapView)))
+                    .after(flight::celestial_orbit_system),
                 orbit::orbit_prediction_system.run_if(in_state(AppState::MapView)),
                 flight::map_view_toggle_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
                 flight::time_warp_system.run_if(in_state(AppState::Flight).or(in_state(AppState::MapView))),
@@ -224,6 +244,11 @@ fn main() {
             (
                 floating_origin_system
                     .before(PhysicsSet::SyncBackend),
+                flight::sim_state_readback_system
+                    .after(PhysicsSet::Writeback)
+                    .before(TransformSystem::TransformPropagate),
+                flight::sim_invariant_check_system
+                    .after(PhysicsSet::Writeback),
                 sun_light_system
                     .after(PhysicsSet::Writeback)
                     .before(TransformSystem::TransformPropagate),
@@ -263,11 +288,17 @@ fn setup_scene(
             orbit_speed: 0.0,
             rotation_speed: constants::KERBIN_ROTATION_SPEED,
         },
-    )).id();
+    )).insert(sim::SimState {
+        position: sim::SsbPosition(sim::DVec3::ZERO),
+        velocity: sim::SsbVelocity(sim::DVec3::ZERO),
+    }).id();
 
     let mun_mu = constants::MUN_SURFACE_GRAVITY * constants::MUN_RADIUS * constants::MUN_RADIUS;
     let mun_orbital_speed = f32::sqrt(kerbin_mu / constants::MUN_ORBIT_RADIUS);
     let mun_angular_speed = mun_orbital_speed / constants::MUN_ORBIT_RADIUS;
+    let mun_ssb_pos = sim::DVec3::new(constants::MUN_ORBIT_RADIUS as f64, 0.0, 0.0);
+    // Mun orbital velocity at t=0: tangent to circular orbit, CCW in XZ plane
+    let mun_ssb_vel = sim::DVec3::new(0.0, 0.0, mun_orbital_speed as f64);
     commands.spawn((
         Mesh3d(meshes.add(Sphere::new(constants::MUN_RADIUS).mesh().uv(24, 12))),
         MeshMaterial3d(materials.add(generate_mun_material(&mut images))),
@@ -286,7 +317,10 @@ fn setup_scene(
         },
         OrbitAngle(0.0),
         OrbitParent(kerbin_entity),
-    ));
+    )).insert(sim::SimState {
+        position: sim::SsbPosition(mun_ssb_pos),
+        velocity: sim::SsbVelocity(mun_ssb_vel),
+    });
 
     // Minmus — small, distant, inclined orbit
     let minmus_mu = constants::MINMUS_SURFACE_GRAVITY * constants::MINMUS_RADIUS * constants::MINMUS_RADIUS;
@@ -295,6 +329,14 @@ fn setup_scene(
     let minmus_inclination = constants::MINMUS_INCLINATION_DEG.to_radians();
     // Start at ascending node (inclined orbit, initial angle = 0)
     let minmus_start = Quat::from_rotation_z(minmus_inclination) * Vec3::new(constants::MINMUS_ORBIT_RADIUS, 0.0, 0.0);
+    let minmus_ssb_pos = sim::DVec3::new(minmus_start.x as f64, minmus_start.y as f64, minmus_start.z as f64);
+    // Minmus orbital velocity at t=0: tangent to inclined circular orbit
+    let minmus_vel_dir = Quat::from_rotation_z(minmus_inclination) * Vec3::new(0.0, 0.0, 1.0);
+    let minmus_ssb_vel = sim::DVec3::new(
+        (minmus_vel_dir.x * minmus_orbital_speed) as f64,
+        (minmus_vel_dir.y * minmus_orbital_speed) as f64,
+        (minmus_vel_dir.z * minmus_orbital_speed) as f64,
+    );
     commands.spawn((
         Mesh3d(meshes.add(Sphere::new(constants::MINMUS_RADIUS).mesh().ico(5).unwrap())),
         MeshMaterial3d(materials.add(Color::srgb(0.55, 0.7, 0.5))),
@@ -314,9 +356,14 @@ fn setup_scene(
         OrbitAngle(0.0),
         OrbitParent(kerbin_entity),
         OrbitInclination(minmus_inclination),
-    ));
+    )).insert(sim::SimState {
+        position: sim::SsbPosition(minmus_ssb_pos),
+        velocity: sim::SsbVelocity(minmus_ssb_vel),
+    });
 
     // Sun — orbits Kerbin in ECI frame, angular speed matches Kerbin rotation for day/night
+    let sun_ssb_pos = sim::DVec3::new(constants::SUN_ORBIT_RADIUS as f64, 0.0, 0.0);
+    let sun_ssb_vel = sim::DVec3::new(0.0, 0.0, (constants::KERBIN_ROTATION_SPEED * constants::SUN_ORBIT_RADIUS) as f64);
     commands.spawn((
         Mesh3d(meshes.add(Sphere::new(constants::SUN_RADIUS).mesh().ico(6).unwrap())),
         MeshMaterial3d(materials.add(StandardMaterial {
@@ -338,7 +385,10 @@ fn setup_scene(
         OrbitAngle(0.0),
         OrbitParent(kerbin_entity),
         SunMarker,
-    ));
+    )).insert(sim::SimState {
+        position: sim::SsbPosition(sun_ssb_pos),
+        velocity: sim::SsbVelocity(sun_ssb_vel),
+    });
 
     let equator_rot = Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
     commands.spawn((
@@ -702,7 +752,7 @@ fn main_menu_button_system(
             match button {
                 MenuButton::Start => next_state.set(AppState::VAB),
                 MenuButton::Orbit => {
-                    commands.insert_resource(DebugLaunched);
+                    commands.insert_resource(DebugLaunched(DebugOrbitPreset::default()));
                     next_state.set(AppState::Flight);
                 }
                 MenuButton::Quit => { exit_events.send(AppExit::Success); }
@@ -719,11 +769,12 @@ fn camera_controller(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     state: Res<State<AppState>>,
     map_focus: Res<MapFocus>,
+    offset: Res<sim::LocalOffset>,
     mut mouse_motion_events: EventReader<MouseMotion>,
     mut mouse_wheel_events: EventReader<MouseWheel>,
     mut query: Query<(&mut Transform, &mut OrbitCamera)>,
-    rocket_query: Query<&Transform, (With<Rocket>, Without<OrbitCamera>)>,
-    planet_query: Query<(Entity, &CelestialBody, &Transform), (With<CelestialBody>, Without<OrbitCamera>)>,
+    rocket_query: Query<(&Transform, &sim::SimState), (With<Rocket>, Without<OrbitCamera>)>,
+    planet_query: Query<(Entity, &CelestialBody, &sim::SimState), (With<CelestialBody>, Without<OrbitCamera>)>,
 ) {
     if *state.get() == AppState::MainMenu {
         for (mut transform, _) in query.iter_mut() {
@@ -745,29 +796,30 @@ fn camera_controller(
     } else if *state.get() == AppState::MapView {
         let focus_pos = match &map_focus.target {
             MapFocusTarget::Body(entity) => {
-                planet_query.get(*entity).ok().map(|(_, _, tf)| tf.translation)
+                planet_query.get(*entity).ok().map(|(_, _, sim)| sim.position.to_local(&offset))
             }
             MapFocusTarget::Rocket => {
-                rocket_query.get_single().ok().map(|t| t.translation)
+                rocket_query.get_single().ok().map(|(tf, _)| tf.translation)
             }
             MapFocusTarget::SoiBody => {
-                let rocket_pos = rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
-                let (_, body_tf) = orbit::find_soi_body(rocket_pos, planet_query.iter().map(|(_, b, t)| (b, t)), false);
-                Some(body_tf.translation)
+                let rocket_sim = rocket_query.get_single().ok().map(|(_, s)| s.position).unwrap_or(sim::SsbPosition::default());
+                let (_, body_sim) = orbit::find_soi_body(rocket_sim, planet_query.iter().map(|(_, b, s)| (b, s)), false);
+                Some(body_sim.position.to_local(&offset))
             }
         };
         if let Some(pos) = focus_pos {
             (pos, Vec3::Y)
         } else {
-            let rocket_pos = rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
-            let (_, body_tf) = orbit::find_soi_body(rocket_pos, planet_query.iter().map(|(_, b, t)| (b, t)), false);
-            (body_tf.translation, Vec3::Y)
+            let rocket_sim = rocket_query.get_single().ok().map(|(_, s)| s.position).unwrap_or(sim::SsbPosition::default());
+            let (_, body_sim) = orbit::find_soi_body(rocket_sim, planet_query.iter().map(|(_, b, s)| (b, s)), false);
+            (body_sim.position.to_local(&offset), Vec3::Y)
         }
     } else {
-        let rocket_pos = rocket_query.get_single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
-        let (_, body_tf) = orbit::find_soi_body(rocket_pos, planet_query.iter().map(|(_, b, t)| (b, t)), false);
-        let up = (rocket_pos - body_tf.translation).try_normalize().unwrap_or(Vec3::Y);
-        (rocket_pos, up)
+        let Ok((rocket_tf, rocket_sim)) = rocket_query.get_single() else { return };
+        let (_, body_sim) = orbit::find_soi_body(rocket_sim.position, planet_query.iter().map(|(_, b, s)| (b, s)), false);
+        let body_local = body_sim.position.to_local(&offset);
+        let up = (rocket_tf.translation - body_local).try_normalize().unwrap_or(Vec3::Y);
+        (rocket_tf.translation, up)
     };
 
     let mut kb_yaw_delta = 0.0;
@@ -788,18 +840,24 @@ fn camera_controller(
     }
 
     for event in mouse_wheel_events.read() {
-        let zoom_scale = if *state.get() == AppState::MapView {
-            100.0
-        } else if *state.get() == AppState::VAB {
-            5.0
+        if *state.get() == AppState::MapView {
+            // Exponential zoom: each scroll step multiplies/divides distance by ~1.12
+            let factor = 1.12_f32.powf(-event.y);
+            for (_, mut orbit) in query.iter_mut() {
+                orbit.distance *= factor;
+            }
         } else {
-            2.0
-        };
+            let zoom_scale = if *state.get() == AppState::VAB {
+                5.0
+            } else {
+                2.0
+            };
 
-        if let MouseScrollUnit::Line = event.unit {
-            zoom_delta -= event.y * zoom_scale;
-        } else {
-            zoom_delta -= event.y * (zoom_scale * 0.01);
+            if let MouseScrollUnit::Line = event.unit {
+                zoom_delta -= event.y * zoom_scale;
+            } else {
+                zoom_delta -= event.y * (zoom_scale * 0.01);
+            }
         }
     }
 
@@ -815,7 +873,7 @@ fn camera_controller(
         orbit.pitch = orbit.pitch.clamp(-1.5, 1.5);
 
         let (min_dist, max_dist) = if *state.get() == AppState::MapView {
-            (2100.0, 30000.0)
+            (200.0, 500_000.0)
         } else if *state.get() == AppState::VAB {
             (3.0, 50.0)
         } else {
@@ -823,10 +881,6 @@ fn camera_controller(
         };
 
         orbit.distance += zoom_delta;
-
-        if *state.get() == AppState::MapView && orbit.distance < min_dist {
-            orbit.distance = 5000.0;
-        }
 
         orbit.distance = orbit.distance.clamp(min_dist, max_dist);
 
@@ -843,8 +897,7 @@ fn camera_controller(
 // ===== Floating Origin =====
 
 fn floating_origin_system(
-    settings: Res<FloatingOriginSettings>,
-    mut offset: ResMut<FloatingOriginOffset>,
+    mut offset: ResMut<sim::LocalOffset>,
     mut set: ParamSet<(
         Query<&Transform, With<FloatingOrigin>>,
         Query<&mut Transform>,
@@ -854,13 +907,14 @@ fn floating_origin_system(
         Ok(tf) => tf.translation,
         Err(_) => return,
     };
-    if pos.length() < settings.threshold { return; }
+    if pos.length() < constants::FLOATING_ORIGIN_THRESHOLD { return; }
 
+    let shift = pos.as_dvec3();
     for mut tf in set.p1().iter_mut() {
         tf.translation -= pos;
     }
 
-    offset.0 += pos;
+    offset.0 += shift;
     debug!("floating_origin: shifted by ({:.1},{:.1},{:.1}) | cumulative offset=({:.1},{:.1},{:.1})",
         pos.x, pos.y, pos.z,
         offset.0.x, offset.0.y, offset.0.z,

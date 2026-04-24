@@ -2,7 +2,6 @@ use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
 use crate::{AppState, CelestialBody, Rocket, OrbitCamera, StageMarker, ExhaustFlame, FuelTank, Engine, FloatingOrigin, OrbitAngle, OrbitParent, OrbitInclination, SasMode};
-use crate::DebugLaunched;
 use crate::vab::RocketConfig;
 use crate::constants::*;
 
@@ -40,6 +39,7 @@ pub fn spawn_flight(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    offset: Res<crate::sim::LocalOffset>,
     config: Res<RocketConfig>,
     mut camera_q: Query<&mut OrbitCamera>,
     rocket_q: Query<(), With<Rocket>>,
@@ -88,11 +88,12 @@ pub fn spawn_flight(
             crate::vab::StageType::HeavyBooster => mat_heavy.clone(),
         };
         let y = y_positions[i];
+        let local_pos = Vec3::new(y, 0.0, 0.0);
 
-        let mut entity_cmds = commands.spawn((
+        let entity = commands.spawn((
             Mesh3d(meshes.add(Cylinder::new(stage.radius, stage.height))),
             MeshMaterial3d(stage_mat),
-            Transform::from_xyz(y, 0.0, 0.0).with_rotation(equator_rot),
+            Transform::from_translation(local_pos).with_rotation(equator_rot),
             RigidBody::Dynamic,
             GravityScale(0.0),
             Collider::cylinder(stage.height / 2.0, stage.radius),
@@ -110,7 +111,12 @@ pub fn spawn_flight(
             },
             StageMarker(i),
             FlightEntity,
-        ));
+        )).insert(crate::sim::SimState {
+            position: offset.ssb_from_local(local_pos),
+            velocity: crate::sim::SsbVelocity(crate::sim::DVec3::ZERO),
+        }).id();
+
+        let mut entity_cmds = commands.entity(entity);
 
         if is_top {
             entity_cmds.insert((
@@ -266,16 +272,16 @@ pub fn cleanup_game(
     mut time_warp: ResMut<crate::TimeWarp>,
     mut time: ResMut<Time<Virtual>>,
     mut maneuver: ResMut<crate::orbit::ManeuverNode>,
-    mut offset: ResMut<crate::FloatingOriginOffset>,
+    mut offset: ResMut<crate::sim::LocalOffset>,
     mut transform_q: Query<&mut Transform>,
 ) {
     // Reset floating origin: shift everything back to true world coordinates
     if offset.0.length() > 0.0 {
-        let shift = offset.0;
+        let shift = offset.0.as_vec3();
         for mut tf in transform_q.iter_mut() {
             tf.translation += shift;
         }
-        offset.0 = Vec3::ZERO;
+        offset.0 = crate::sim::DVec3::ZERO;
     }
 
     for entity in game_entities.iter() {
@@ -293,9 +299,10 @@ pub fn rocket_flight_system(
     real_time: Res<bevy::time::Time<bevy::time::Real>>,
     keys: Res<ButtonInput<KeyCode>>,
     time_warp: Res<crate::TimeWarp>,
+    offset: Res<crate::sim::LocalOffset>,
     mut commands: Commands,
-    planet_q: Query<(&CelestialBody, &Transform), Without<Rocket>>,
-    mut rocket_q: Query<(Entity, &mut Rocket, &Transform, &mut ExternalForce, &Velocity, &mut FuelTank, &Engine, &mut ColliderMassProperties)>,
+    planet_q: Query<(&CelestialBody, &crate::sim::SimState), Without<Rocket>>,
+    mut rocket_q: Query<(Entity, &mut Rocket, &Transform, &mut ExternalForce, &Velocity, &mut FuelTank, &Engine, &mut ColliderMassProperties, &crate::sim::SimState)>,
     mut part_q: Query<(Entity, &mut FuelTank, &Engine, &mut ExternalForce, &mut ColliderMassProperties, &Transform, &Velocity), Without<Rocket>>,
     mut flame_q: Query<(&mut Visibility, &ExhaustFlame)>,
     joint_q: Query<(Entity, &ImpulseJoint)>,
@@ -303,7 +310,7 @@ pub fn rocket_flight_system(
     let real_dt = real_time.delta_secs();
     let warp_rate = time_warp.rate();
 
-    let Ok((rocket_entity, mut rocket, rocket_tf, mut rocket_ext_force, rocket_vel, mut rocket_fuel, rocket_engine, mut rocket_mass_props)) = rocket_q.get_single_mut() else { return; };
+    let Ok((rocket_entity, mut rocket, rocket_tf, mut rocket_ext_force, rocket_vel, mut rocket_fuel, rocket_engine, mut rocket_mass_props, rocket_sim)) = rocket_q.get_single_mut() else { return; };
 
     if warp_rate > 1.0 {
         rocket.throttle = 0.0;
@@ -371,7 +378,7 @@ pub fn rocket_flight_system(
     if keys.pressed(KeyCode::KeyE) { target_torque.y -= ROCKET_TORQUE; manual_input = true; }
 
     // Compute orbital velocity for SAS alignment
-    let (soi_body, soi_tf) = crate::orbit::find_soi_body(rocket_tf.translation, planet_q.iter(), false);
+    let (soi_body, soi_sim) = crate::orbit::find_soi_body(rocket_sim.position, planet_q.iter(), false);
 
     let world_torque = if manual_input {
         rocket_tf.rotation * target_torque
@@ -379,19 +386,16 @@ pub fn rocket_flight_system(
         match rocket.sas_mode {
             SasMode::Stability => -rocket_vel.angvel * SAS_DAMPING,
             SasMode::Prograde | SasMode::Retrograde => {
-                let rel_pos = rocket_tf.translation - soi_tf.translation;
-                let soi_vel = crate::orbit::soi_body_velocity(soi_body, soi_tf);
-                let orbital_vel = rocket_vel.linvel
-                    + crate::orbit::surface_rotation_velocity(soi_body, rel_pos)
-                    - soi_vel;
-                let speed = orbital_vel.length();
+                let orbital_vel = rocket_sim.velocity.0 - soi_sim.velocity.0;
+                let orbital_vel_f32 = orbital_vel.as_vec3();
+                let speed = orbital_vel_f32.length();
                 if speed < 1.0 {
                     -rocket_vel.angvel * SAS_DAMPING
                 } else {
                     let desired_forward = if rocket.sas_mode == SasMode::Prograde {
-                        orbital_vel.normalize()
+                        orbital_vel_f32.normalize()
                     } else {
-                        -orbital_vel.normalize()
+                        -orbital_vel_f32.normalize()
                     };
                     // Align rocket's up() to desired_forward
                     let current_up = rocket_tf.up();
@@ -412,10 +416,12 @@ pub fn rocket_flight_system(
 
     rocket_ext_force.torque = world_torque;
 
-    // N-body gravity: collect all planet positions so the closure can iterate them
+    // N-body gravity: collect all planet positions (local frame) so the closure can iterate them
+    // SSB-to-local conversion for each body position.
     let planet_gravity: Vec<(f32, Vec3)> = planet_q.iter()
-        .map(|(b, tf)| (b.mu, tf.translation))
+        .map(|(b, sim)| (b.mu, (sim.position.0 - offset.0).as_vec3()))
         .collect();
+    let soi_local = (soi_sim.position.0 - offset.0).as_vec3();
 
     let compute_gravity_and_drag = |pos: Vec3, mass: f32, vel: &Velocity| -> Vec3 {
         let mut force = Vec3::ZERO;
@@ -430,7 +436,7 @@ pub fn rocket_flight_system(
             }
         }
         // Atmospheric drag from SOI body only
-        let to_soi = soi_tf.translation - pos;
+        let to_soi = soi_local - pos;
         let soi_dist = to_soi.length();
         let altitude = soi_dist - soi_body.radius;
         if altitude < soi_body.atmosphere_height && soi_body.atmosphere_height > 0.0 {
@@ -498,15 +504,16 @@ pub fn rocket_flight_system(
 }
 
 pub fn telemetry_system(
-    planet_q: Query<(&CelestialBody, &Transform), Without<Rocket>>,
-    rocket_q: Query<(&Rocket, &Transform, &Velocity)>,
+    _offset: Res<crate::sim::LocalOffset>,
+    planet_q: Query<(&CelestialBody, &crate::sim::SimState), Without<Rocket>>,
+    rocket_q: Query<(&Rocket, &Transform, &Velocity, &crate::sim::SimState)>,
     part_q: Query<(&FuelTank, &Engine)>,
     mut text_q: Query<&mut Text, With<TelemetryUI>>,
     time_warp: Res<crate::TimeWarp>,
     time: Res<Time<Virtual>>,
     maneuver: Res<crate::orbit::ManeuverNode>,
 ) {
-    let Ok((rocket, transform, velocity)) = rocket_q.get_single() else { return; };
+    let Ok((rocket, transform, velocity, rocket_sim)) = rocket_q.get_single() else { return; };
     let Ok(mut text) = text_q.get_single_mut() else { return; };
 
     let mut current_fuel = 0.0;
@@ -520,18 +527,18 @@ pub fn telemetry_system(
         }
     }
 
-    let (planet, p_transform) = crate::orbit::find_soi_body(transform.translation, planet_q.iter(), false);
+    let (planet, planet_sim) = crate::orbit::find_soi_body(rocket_sim.position, planet_q.iter(), false);
 
-    let planet_center = p_transform.translation;
-    let to_planet = transform.translation - planet_center;
-    let dist = to_planet.length();
-    let local_up = if dist > 0.0 { to_planet / dist } else { Vec3::Y };
+    let rel_pos_d = rocket_sim.position.0 - planet_sim.position.0;
+    let rel_pos = rel_pos_d.as_vec3();
+    let dist = rel_pos.length();
+    let local_up = if dist > 0.0 { rel_pos / dist } else { Vec3::Y };
     let altitude = dist - planet.radius;
 
-    let rel_pos = transform.translation - planet_center;
-    let soi_vel = crate::orbit::soi_body_velocity(planet, p_transform);
-    let inertial_vel = velocity.linvel + crate::orbit::surface_rotation_velocity(planet, rel_pos) - soi_vel;
-    let orbital_vel_mag = inertial_vel.length();
+    // Orbital velocity = rocket SSB vel - body SSB vel (inertial frame)
+    let orbital_vel_d = rocket_sim.velocity.0 - planet_sim.velocity.0;
+    let orbital_vel = orbital_vel_d.as_vec3();
+    let orbital_vel_mag = orbital_vel.length();
 
     let pitch_deg = transform.up().dot(local_up).asin().to_degrees();
     let vertical_vel = velocity.linvel.dot(local_up);
@@ -545,26 +552,32 @@ pub fn telemetry_system(
     };
 
     let ap_pe_str = {
-        let h = rel_pos.cross(inertial_vel);
-        let h_mag = h.length();
-        let e_vec = if h_mag > 0.001 { (inertial_vel.cross(h) / planet.mu) - rel_pos.normalize() } else { Vec3::ZERO };
-        let e = e_vec.length();
-        let energy = inertial_vel.length_squared() / 2.0 - planet.mu / rel_pos.length();
-        let a = if e < 1.0 && energy.abs() > 0.001 { -planet.mu / (2.0 * energy) } else { 0.0 };
+        // f64 orbit element computation for precision
+        let mu_d = planet.mu as f64;
+        let h_d = rel_pos_d.cross(orbital_vel_d);
+        let h_mag_d = h_d.length();
+        let e_vec_d = if h_mag_d > 0.001 {
+            (orbital_vel_d.cross(h_d) / mu_d) - rel_pos_d.normalize()
+        } else {
+            crate::sim::DVec3::ZERO
+        };
+        let e = e_vec_d.length();
+        let energy = orbital_vel_d.length_squared() / 2.0 - mu_d / rel_pos_d.length();
+        let a = if e < 1.0 && energy.abs() > 0.001 { -mu_d / (2.0 * energy) } else { 0.0 };
         if e > 0.001 && e < 1.0 && a > 0.0 {
             let r_ap = a * (1.0 + e);
             let r_pe = a * (1.0 - e);
-            let ap_alt = r_ap - planet.radius;
-            let pe_alt = r_pe - planet.radius;
+            let ap_alt = (r_ap - planet.radius as f64) as f32;
+            let pe_alt = (r_pe - planet.radius as f64) as f32;
 
             // Orbital period: T = 2π √(a³/μ)
-            let period = std::f32::consts::TAU * (a * a * a / planet.mu).sqrt();
+            let period = std::f64::consts::TAU * (a * a * a / mu_d).sqrt();
             let p_min = (period / 60.0).floor() as i32;
             let p_sec = (period % 60.0).round() as i32;
 
             // Orbital inclination: angle between orbital plane and reference plane
-            let inc = if h_mag > 0.001 {
-                let h_dir = h / h_mag;
+            let inc = if h_mag_d > 0.001 {
+                let h_dir = h_d / h_mag_d;
                 h_dir.y.asin().abs().to_degrees()
             } else { 0.0 };
 
@@ -643,12 +656,12 @@ pub fn time_warp_system(
     keys: Res<ButtonInput<KeyCode>>,
     mut time_warp: ResMut<crate::TimeWarp>,
     mut time: ResMut<Time<Virtual>>,
-    rocket_q: Query<&Transform, With<Rocket>>,
-    planet_q: Query<(&CelestialBody, &Transform), Without<Rocket>>,
+    rocket_q: Query<&crate::sim::SimState, With<Rocket>>,
+    planet_q: Query<(&CelestialBody, &crate::sim::SimState), Without<Rocket>>,
 ) {
-    if let Ok(rocket_tf) = rocket_q.get_single() {
-        let (body, body_tf) = crate::orbit::find_soi_body(rocket_tf.translation, planet_q.iter(), false);
-        let altitude = (rocket_tf.translation - body_tf.translation).length() - body.radius;
+    if let Ok(rocket_sim) = rocket_q.get_single() {
+        let (body, body_sim) = crate::orbit::find_soi_body(rocket_sim.position, planet_q.iter(), false);
+        let altitude = (rocket_sim.position.0 - body_sim.position.0).length() as f32 - body.radius;
         if altitude < body.atmosphere_height && body.atmosphere_height > 0.0 {
             if time_warp.index > 0 {
                 time_warp.index = 0;
@@ -678,29 +691,178 @@ pub fn time_warp_system(
 
 pub fn celestial_orbit_system(
     time: Res<Time<Virtual>>,
-    mut orbit_q: Query<(&mut OrbitAngle, &OrbitParent, &CelestialBody, &mut Transform, Option<&OrbitInclination>)>,
-    parent_q: Query<&Transform, (With<CelestialBody>, Without<OrbitAngle>)>,
+    offset: Res<crate::sim::LocalOffset>,
+    mut orbit_q: Query<(&mut OrbitAngle, &OrbitParent, &CelestialBody, &mut crate::sim::SimState, &mut Transform, Option<&OrbitInclination>)>,
+    parent_q: Query<&crate::sim::SimState, (With<CelestialBody>, Without<OrbitAngle>)>,
 ) {
     let dt = time.delta_secs();
-    for (mut angle, parent, body, mut transform, inclination) in orbit_q.iter_mut() {
+    for (mut angle, parent, body, mut sim, mut transform, inclination) in orbit_q.iter_mut() {
         if body.orbit_radius > 0.0 && body.orbit_speed > 0.0 {
             angle.0 += body.orbit_speed * dt;
-            let parent_pos = parent_q.get(parent.0)
-                .map(|t| t.translation)
-                .unwrap_or(Vec3::ZERO);
-            let plane_pos = Vec3::new(
-                body.orbit_radius * angle.0.cos(),
-                0.0,
-                body.orbit_radius * angle.0.sin(),
-            );
-            let inc = inclination.map(|i| i.0).unwrap_or(0.0);
-            let rotated = if inc != 0.0 {
-                Quat::from_rotation_x(inc) * plane_pos
+
+            // Get parent SSB state
+            let parent_ssb_pos = parent_q.get(parent.0)
+                .map(|s| s.position.0)
+                .unwrap_or(crate::sim::DVec3::ZERO);
+            let parent_ssb_vel = parent_q.get(parent.0)
+                .map(|s| s.velocity.0)
+                .unwrap_or(crate::sim::DVec3::ZERO);
+
+            let orbit_r = body.orbit_radius as f64;
+            let a = angle.0 as f64;
+            let w = body.orbit_speed as f64;
+            let inc = inclination.map(|i| i.0).unwrap_or(0.0) as f64;
+
+            // Position in orbital plane
+            let px = orbit_r * a.cos();
+            let pz = orbit_r * a.sin();
+
+            // Velocity in orbital plane (d/dt)
+            let vx = -orbit_r * a.sin() * w;
+            let vz = orbit_r * a.cos() * w;
+
+            // Apply inclination (rotation around X axis)
+            let (pos, vel) = if inc != 0.0 {
+                let ci = inc.cos();
+                let si = inc.sin();
+                (
+                    crate::sim::DVec3::new(px, pz * si, pz * ci),
+                    crate::sim::DVec3::new(vx, vz * si, vz * ci),
+                )
             } else {
-                plane_pos
+                (crate::sim::DVec3::new(px, 0.0, pz), crate::sim::DVec3::new(vx, 0.0, vz))
             };
-            transform.translation = parent_pos + rotated;
+
+            // Update SimState (truth)
+            sim.position = crate::sim::SsbPosition(parent_ssb_pos + pos);
+            sim.velocity = crate::sim::SsbVelocity(parent_ssb_vel + vel);
+
+            // Derive Transform from SSB + LocalOffset
+            transform.translation = sim.position.to_local(&offset);
         }
+    }
+}
+
+/// Read back Rapier physics results into SimState for dynamic bodies (rocket + parts).
+/// Must run after Rapier writeback.
+pub fn sim_state_readback_system(
+    offset: Res<crate::sim::LocalOffset>,
+    mut q: Query<(&Transform, &Velocity, &mut crate::sim::SimState), With<RigidBody>>,
+) {
+    for (tf, vel, mut sim) in q.iter_mut() {
+        sim.position = offset.ssb_from_local(tf.translation);
+        sim.velocity = offset.ssb_vel_from_local(vel.linvel);
+    }
+}
+
+/// Debug: verify SimState ↔ Transform consistency every frame.
+/// Catches conversion bugs, double-offset, missing offset, etc.
+pub fn sim_invariant_check_system(
+    offset: Res<crate::sim::LocalOffset>,
+    body_q: Query<(&Transform, &crate::sim::SimState, &CelestialBody, Option<&OrbitAngle>), With<CelestialBody>>,
+    rocket_q: Query<(&crate::sim::SimState, &Rocket), With<RigidBody>>,
+    mut prev_energy: Local<Option<f64>>,
+    mut warn_timer: Local<Timer>,
+    time: Res<Time<Virtual>>,
+) {
+    if warn_timer.duration().as_secs_f32() == 0.0 {
+        *warn_timer = Timer::from_seconds(2.0, TimerMode::Repeating);
+    }
+    let should_warn = warn_timer.tick(time.delta()).just_finished();
+
+    // Check 1: For all entities, SimState.position → local should match Transform.translation
+    for (tf, sim, ..) in body_q.iter() {
+        let expected_local = sim.position.to_local(&offset);
+        let err = (tf.translation - expected_local).length();
+        if err > 0.1 && should_warn {
+            warn!(
+                "Sim invariant FAIL: body transform ({:.1},{:.1},{:.1}) != SSB→local ({:.1},{:.1},{:.1}) | err={:.2}",
+                tf.translation.x, tf.translation.y, tf.translation.z,
+                expected_local.x, expected_local.y, expected_local.z,
+                err,
+            );
+        }
+    }
+
+    // Check 2: For orbiting bodies, velocity should be consistent with orbit parameters
+    for (_, sim, body, angle) in body_q.iter() {
+        let Some(_angle) = angle else { continue };
+        if body.orbit_radius > 0.0 && body.orbit_speed > 0.0 {
+            let expected_speed = body.orbit_speed * body.orbit_radius;
+            let actual_speed = sim.velocity.0.length() as f32;
+            let rel_err = (actual_speed - expected_speed).abs() / expected_speed;
+            if rel_err > 0.01 && should_warn {
+                warn!(
+                    "Sim invariant FAIL: {} orbital speed {:.2} != expected {:.2} (orbit_speed×radius) | rel_err={:.4}",
+                    body.name, actual_speed, expected_speed, rel_err,
+                );
+            }
+        }
+    }
+
+    // Check 3: Kerbin should be at origin with zero velocity
+    for (_, sim, body, _) in body_q.iter() {
+        if body.name == "Kerbin" {
+            if sim.position.0.length() > 0.01 && should_warn {
+                warn!("Sim invariant FAIL: Kerbin SSB position != zero: ({:.1},{:.1},{:.1})",
+                    sim.position.0.x, sim.position.0.y, sim.position.0.z);
+            }
+            if sim.velocity.0.length() > 0.01 && should_warn {
+                warn!("Sim invariant FAIL: Kerbin SSB velocity != zero: ({:.4},{:.4},{:.4})",
+                    sim.velocity.0.x, sim.velocity.0.y, sim.velocity.0.z);
+            }
+        }
+    }
+
+    // Check 4: Energy conservation for rocket (when coasting, no atmosphere)
+    // Specific orbital energy: E = v²/2 - μ/r  (relative to SOI body)
+    // Should be constant when no thrust and no drag.
+    if let Ok((rocket_sim, rocket)) = rocket_q.get_single() {
+        let (planet, _) = crate::orbit::find_soi_body(
+            rocket_sim.position, body_q.iter().map(|(_, s, b, _)| (b, s)), false,
+        );
+        // Re-derive planet_sim from the query
+        let planet_sim = body_q.iter()
+            .find(|(_, _, b, _)| b.name == planet.name)
+            .map(|(_, s, _, _)| s);
+
+        if let Some(planet_sim) = planet_sim {
+            let rel_pos = rocket_sim.position.0 - planet_sim.position.0;
+            let rel_vel = rocket_sim.velocity.0 - planet_sim.velocity.0;
+            let r = rel_pos.length();
+            let v_sq = rel_vel.length_squared();
+
+            if r > 1.0 && planet.mu > 0.0 {
+                let energy = v_sq / 2.0 - planet.mu as f64 / r;
+
+                // Only check when coasting (no thrust) and above atmosphere
+                let altitude = r as f32 - planet.radius;
+                let in_atm = altitude < planet.atmosphere_height && planet.atmosphere_height > 0.0;
+                let coasting = rocket.throttle < 0.01 && !in_atm;
+
+                if coasting && energy.abs() > 1.0 {
+                    if let Some(prev_e) = *prev_energy {
+                        let rel_err = (energy - prev_e).abs() / prev_e.abs().max(1.0);
+                        // 5% tolerance — accounts for Rapier integration error + time warp
+                        if rel_err > 0.05 && should_warn {
+                            warn!(
+                                "Sim invariant FAIL: energy drift | prev={:.2} now={:.2} | Δ={:.2} ({:.1}%) | alt={:.0} throttle={:.0}%",
+                                prev_e, energy, energy - prev_e, rel_err * 100.0,
+                                altitude, rocket.throttle * 100.0,
+                            );
+                        }
+                    }
+                    *prev_energy = Some(energy);
+                } else {
+                    // Reset tracking when thrusting or in atmosphere
+                    *prev_energy = None;
+                }
+            }
+        } else {
+            *prev_energy = None;
+        }
+    } else {
+        *prev_energy = None;
     }
 }
 
@@ -759,6 +921,14 @@ pub fn map_view_toggle_system(
             AppState::MapView => next_state.set(AppState::Flight),
             _ => {}
         }
+    }
+}
+
+pub fn enter_map_view_system(
+    mut camera_q: Query<&mut OrbitCamera>,
+) {
+    for mut orbit in camera_q.iter_mut() {
+        orbit.distance = 8000.0;
     }
 }
 
@@ -822,63 +992,89 @@ pub fn map_icon_system(
 
 pub fn debug_orbit_apply_system(
     mut commands: Commands,
-    launched: Option<ResMut<DebugLaunched>>,
-    planet_q: Query<(&CelestialBody, &Transform), Without<FlightEntity>>,
+    launched: Option<ResMut<crate::DebugLaunched>>,
+    local_offset: Res<crate::sim::LocalOffset>,
+    planet_q: Query<(&CelestialBody, &crate::sim::SimState), Without<FlightEntity>>,
     mut transforms: ParamSet<(
         Query<&Transform, (With<Rocket>, With<FlightEntity>)>,
         Query<&mut Transform, With<FlightEntity>>,
     )>,
+    mut sim_q: Query<&mut crate::sim::SimState, With<FlightEntity>>,
     mut rocket_mut: Query<&mut Rocket>,
     mut vel_q: Query<&mut Velocity, With<FlightEntity>>,
 ) {
-    if launched.is_none() { return; }
+    let Some(launched) = launched else { return };
 
     let rocket_pos = match transforms.p0().get_single() {
         Ok(tf) => tf.translation,
         Err(_) => return,
     };
 
-    let (mun_body, mun_tf) = match planet_q.iter().find(|(b, _)| b.name == "Mun") {
+    let (kerbin_body, kerbin_sim) = match planet_q.iter().find(|(b, _)| b.name == "Kerbin") {
         Some(pair) => pair,
         None => return,
     };
 
-    // Circular orbit around Mun at DEBUG_ORBIT_ALTITUDE above surface
-    // mu_mun = g × r² = 1.0 × 200² = 40,000
-    // orbit_r = MUN_RADIUS + altitude = 300
-    // v_circular = sqrt(40,000 / 300) ≈ 11.55 m/s
-    let orbit_r = mun_body.radius + DEBUG_ORBIT_ALTITUDE;
-    let v_circular = (mun_body.mu / orbit_r).sqrt();
+    let mu = kerbin_body.mu as f64;
+    let r_kerbin = kerbin_body.radius as f64;
 
-    // Mun's orbital velocity in world frame
-    // At t=0 Mun is at (14000,0,0), angular_speed ≈ 0.0027 rad/s
-    // Mun velocity = (0, 0, ~37.8) m/s
-    let mun_vel = crate::orbit::soi_body_velocity(mun_body, mun_tf);
+    // Orbit presets: (pe_alt, ap_alt) in meters above surface
+    let (pe_alt, ap_alt) = match launched.0 {
+        crate::DebugOrbitPreset::KerbinElliptical1 => {
+            // Moderate ellipse: 200m × 2000m, T≈162s
+            (200.0, 2000.0)
+        }
+        crate::DebugOrbitPreset::KerbinElliptical2 => {
+            // Highly elliptical: 100m × 4000m, T≈246s
+            (100.0, 4000.0)
+        }
+        crate::DebugOrbitPreset::KerbinElliptical3 => {
+            // Near-circular: 500m × 800m, T≈131s
+            (500.0, 800.0)
+        }
+    };
 
-    // Place rocket on the Mun-far-from-Kerbin side, radial outward
-    // At t=0: mun_dir = (1,0,0), orbit_pos = (14300, 0, 0)
-    let mun_dir = mun_tf.translation.normalize_or(Vec3::X);
-    let orbit_pos = mun_tf.translation + mun_dir * orbit_r;
+    let r_pe = r_kerbin + pe_alt as f64;
+    let r_ap = r_kerbin + ap_alt as f64;
+    let a = (r_pe + r_ap) / 2.0;
 
-    // Prograde: tangent to counterclockwise circular orbit
-    // For radial (cos θ, 0, sin θ), prograde = (-sin θ, 0, cos θ)
-    // At t=0: prograde = (0, 0, 1)
-    let prograde = Vec3::new(-mun_dir.z, 0.0, mun_dir.x);
-    let orbit_vel = mun_vel + prograde * v_circular;
+    // Vis-viva at periapsis: v = sqrt(mu * (2/r - 1/a))
+    let v_pe = (mu * (2.0 / r_pe - 1.0 / a)).sqrt();
 
-    let offset = orbit_pos - rocket_pos;
+    // Place rocket at periapsis: radial direction from Kerbin center along +X
+    let kerbin_pos = kerbin_sim.position.0;
+    let pe_dir = crate::sim::DVec3::X; // periapsis along +X
+    let orbit_ssb_pos = kerbin_pos + pe_dir * r_pe;
+
+    // Velocity at periapsis: tangent (prograde = +Z for +X radial, CCW)
+    let prograde = crate::sim::DVec3::Z;
+    let orbit_ssb_vel = kerbin_sim.velocity.0 + prograde * v_pe;
+
+    debug!(
+        "debug_orbit: preset={:?} | pe_alt={:.0} ap_alt={:.0} | r_pe={:.1} r_ap={:.1} a={:.1} | v_pe={:.2} | mu={:.0}",
+        launched.0, pe_alt, ap_alt, r_pe, r_ap, a, v_pe, mu,
+    );
+
+    // Teleport all flight entities
+    let orbit_local_pos = (orbit_ssb_pos - local_offset.0).as_vec3();
+    let offset_vec = orbit_local_pos - rocket_pos;
 
     for mut tf in transforms.p1().iter_mut() {
-        tf.translation += offset;
+        tf.translation += offset_vec;
     }
 
     for mut vel in vel_q.iter_mut() {
-        vel.linvel = orbit_vel;
+        vel.linvel = orbit_ssb_vel.as_vec3();
+    }
+
+    for mut sim in sim_q.iter_mut() {
+        sim.position = crate::sim::SsbPosition(orbit_ssb_pos);
+        sim.velocity = crate::sim::SsbVelocity(orbit_ssb_vel);
     }
 
     for mut rocket in rocket_mut.iter_mut() {
         rocket.is_launched = true;
     }
 
-    commands.remove_resource::<DebugLaunched>();
+    commands.remove_resource::<crate::DebugLaunched>();
 }
